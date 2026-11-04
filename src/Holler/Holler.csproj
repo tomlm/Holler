@@ -5,6 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Holler</PackageId>
+    <Version>0.1.0</Version>
     <Description>Dead-simple peer-to-peer WebRTC video calls, rooms and data chat for Blazor. Media flows browser-to-browser; SignalR is only used for signaling.</Description>
     <Authors>Tom Laird-McConnell</Authors>
     <PackageTags>blazor;webrtc;signalr;video;p2p</PackageTags>
