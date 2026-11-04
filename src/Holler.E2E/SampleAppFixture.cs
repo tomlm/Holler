@@ -15,6 +15,9 @@ public sealed class SampleAppFixture
     public static string BaseUrl { get; private set; } = "";
     public static IBrowser Browser { get; private set; } = null!;
 
+    /// <summary>Short enough to test "no answer", long enough for the other tests to answer.</summary>
+    public static TimeSpan RingTimeout { get; } = TimeSpan.FromSeconds(8);
+
     private static Process? _app;
     private static IPlaywright? _playwright;
     private static string? _skipReason;
@@ -51,13 +54,14 @@ public sealed class SampleAppFixture
         var port = GetFreePort();
         BaseUrl = $"http://127.0.0.1:{port}/";
         var project = Path.Combine(FindRepoRoot(), "src", "samples", "Holler.Sample", "Holler.Sample");
-        var start = new ProcessStartInfo("dotnet", ["run", "--project", project, "--no-build", "--no-launch-profile", "--urls", BaseUrl])
+        var start = new ProcessStartInfo("dotnet", ["run", "--project", project, "-c", BuildConfiguration, "--no-build", "--no-launch-profile", "--urls", BaseUrl])
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
         start.Environment["ASPNETCORE_ENVIRONMENT"] = "Development";
+        start.Environment["Holler__RingTimeout"] = RingTimeout.ToString();
         _app = Process.Start(start) ?? throw new InvalidOperationException("Could not start the sample app.");
         _app.OutputDataReceived += (_, e) => { if (e.Data is not null) TestContext.Progress.WriteLine($"[app] {e.Data}"); };
         _app.ErrorDataReceived += (_, e) => { if (e.Data is not null) TestContext.Progress.WriteLine($"[app] {e.Data}"); };
@@ -97,6 +101,13 @@ public sealed class SampleAppFixture
         }
         _app?.Dispose();
     }
+
+    // The sample was built alongside these tests, in the same configuration.
+#if DEBUG
+    private const string BuildConfiguration = "Debug";
+#else
+    private const string BuildConfiguration = "Release";
+#endif
 
     private static int GetFreePort()
     {

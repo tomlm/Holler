@@ -17,11 +17,34 @@ public sealed class HollerException(string message) : Exception(message);
 /// signal with its authenticated sender, and only forwards WebRTC negotiation between sessions that share
 /// a call or a room. State is in memory, so all sessions must be connected to the same server instance.
 /// </summary>
-public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<HollerSignalRouter> logger)
+public sealed class HollerSignalRouter(
+    IOptions<HollerOptions> options,
+    IHollerAuthorizer authorizer,
+    TimeProvider time,
+    ILogger<HollerSignalRouter> logger)
 {
     private sealed record Session(string SessionId, string UserId, ISignalSink Sink)
     {
         public HashSet<string> Rooms { get; } = [];
+        public RateWindow Signals { get; } = new(TimeSpan.FromSeconds(1));
+        public RateWindow Rings { get; } = new(TimeSpan.FromMinutes(1));
+    }
+
+    /// <summary>Fixed-window counter; callers hold the router lock.</summary>
+    private sealed class RateWindow(TimeSpan length)
+    {
+        private DateTimeOffset _start;
+        private int _count;
+
+        public bool TryTake(DateTimeOffset now, int limit)
+        {
+            if (now - _start >= length)
+            {
+                _start = now;
+                _count = 0;
+            }
+            return ++_count <= limit;
+        }
     }
 
     private sealed class Call(string callId, Session caller, string calleeUserId)
@@ -31,6 +54,7 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
         public string CalleeUserId { get; } = calleeUserId;
         public string? CalleeSessionId { get; set; }
         public HashSet<string> Busy { get; } = [];
+        public ITimer? RingTimer { get; set; }
         public bool IsRinging => CalleeSessionId is null;
     }
 
@@ -90,17 +114,17 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
                 var hangup = new HollerSignal { Type = SignalType.Hangup, CallId = call.CallId, FromUserId = session.UserId, FromSessionId = sessionId };
                 if (call.Caller == session)
                 {
-                    _calls.Remove(call.CallId);
+                    RemoveCall(call);
                     deliveries.AddRange(CalleeSessions(call).Select(s => new Delivery(s, hangup)));
                 }
                 else if (call.CalleeSessionId == sessionId)
                 {
-                    _calls.Remove(call.CallId);
+                    RemoveCall(call);
                     deliveries.Add(new Delivery(call.Caller, hangup));
                 }
                 else if (call.IsRinging && call.CalleeUserId == session.UserId && !CalleeSessions(call).Any())
                 {
-                    _calls.Remove(call.CallId);
+                    RemoveCall(call);
                     deliveries.Add(new Delivery(call.Caller, new HollerSignal { Type = SignalType.Unavailable, CallId = call.CallId, FromUserId = call.CalleeUserId }));
                 }
             }
@@ -120,17 +144,23 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
     {
         if (string.IsNullOrWhiteSpace(room) || room.Length > 128)
             throw new HollerException("Room names must be 1-128 characters.");
+        var info = GetSession(sessionId) ?? throw new HollerException("Unknown Holler session.");
+        if (!await authorizer.CanJoinRoomAsync(new HollerPeerInfo(info.SessionId, info.UserId), room))
+            throw new HollerException($"Not allowed to join room '{room}'.");
+
         var deliveries = new List<Delivery>();
         HollerPeerInfo[] existing;
         lock (_lock)
         {
             var session = GetSessionLocked(sessionId);
-            if (!_rooms.TryGetValue(room, out var members))
-                _rooms[room] = members = [];
-            if (members.Contains(sessionId))
+            if (_rooms.TryGetValue(room, out var members) && members.Contains(sessionId))
                 return members.Where(m => m != sessionId).Select(m => ToPeer(_sessions[m])).ToArray();
-            if (members.Count >= options.Value.MaxRoomSize)
+            if (session.Rooms.Count >= options.Value.Limits.MaxRoomsPerSession)
+                throw new HollerException($"Already in {session.Rooms.Count} rooms ({options.Value.Limits.MaxRoomsPerSession} max).");
+            if (members?.Count >= options.Value.MaxRoomSize)
                 throw new HollerException($"Room '{room}' is full ({options.Value.MaxRoomSize} max).");
+            if (members is null)
+                _rooms[room] = members = [];
 
             existing = members.Select(m => ToPeer(_sessions[m])).ToArray();
             var joined = new HollerSignal { Type = SignalType.PeerJoined, Room = room, FromUserId = session.UserId, FromSessionId = sessionId };
@@ -158,8 +188,16 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
     }
 
     /// <summary>Routes a signal sent by <paramref name="fromSessionId"/>.</summary>
-    public Task RouteAsync(string fromSessionId, HollerSignal signal)
+    public async Task RouteAsync(string fromSessionId, HollerSignal signal)
     {
+        // Authorization may be async (e.g. a database lookup), so it runs before taking the lock.
+        var allowed = true;
+        if (signal.Type == SignalType.Ring && signal.ToUserId is { } callee)
+        {
+            var caller = GetSession(fromSessionId) ?? throw new HollerException("Unknown Holler session.");
+            allowed = await authorizer.CanCallAsync(new HollerPeerInfo(caller.SessionId, caller.UserId), callee);
+        }
+
         var deliveries = new List<Delivery>();
         lock (_lock)
         {
@@ -167,14 +205,24 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
             if (HollerSignal.IsServerOnly(signal.Type))
             {
                 logger.LogWarning("Session {Session} tried to send server-only signal {Type}", fromSessionId, signal.Type);
-                return Task.CompletedTask;
+                return;
+            }
+            var limits = options.Value.Limits;
+            if (signal.Payload?.Length > limits.MaxPayloadLength || !from.Signals.TryTake(time.GetUtcNow(), limits.SignalsPerSecond))
+            {
+                logger.LogWarning("Dropped {Type} from session {Session}: over size or rate limit", signal.Type, fromSessionId);
+                return;
             }
             // Never trust the client's claim about who it is.
             var stamped = signal with { FromUserId = from.UserId, FromSessionId = from.SessionId };
             switch (signal.Type)
             {
                 case SignalType.Ring:
-                    Ring(from, stamped, deliveries);
+                    if (allowed && from.Rings.TryTake(time.GetUtcNow(), limits.RingsPerMinute))
+                        Ring(from, stamped, deliveries);
+                    else
+                        // Indistinguishable from calling someone offline.
+                        deliveries.Add(new Delivery(from, new HollerSignal { Type = SignalType.Unavailable, CallId = signal.CallId, FromUserId = signal.ToUserId }));
                     break;
                 case SignalType.Accept:
                     Accept(from, stamped, deliveries);
@@ -193,7 +241,7 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
                     break;
             }
         }
-        return DeliverAsync(deliveries);
+        await DeliverAsync(deliveries);
     }
 
     private void Ring(Session from, HollerSignal signal, List<Delivery> deliveries)
@@ -208,6 +256,8 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
             return;
         }
         _calls[callId] = call;
+        if (options.Value.RingTimeout > TimeSpan.Zero)
+            call.RingTimer = time.CreateTimer(_ => _ = RingTimedOutAsync(call), null, options.Value.RingTimeout, Timeout.InfiniteTimeSpan);
         var ring = signal with { ToSessionId = null };
         deliveries.AddRange(targets.Select(s => new Delivery(s, ring)));
     }
@@ -224,6 +274,8 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
         // First accept wins.
         var others = CalleeSessions(call).Where(s => s != from).ToArray();
         call.CalleeSessionId = from.SessionId;
+        call.RingTimer?.Dispose();
+        call.RingTimer = null;
         deliveries.Add(new Delivery(call.Caller, signal with { ToSessionId = call.Caller.SessionId }));
         var elsewhere = new HollerSignal { Type = SignalType.AnsweredElsewhere, CallId = call.CallId };
         deliveries.AddRange(others.Select(s => new Delivery(s, elsewhere)));
@@ -242,7 +294,7 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
             if (ringing.Any(s => !call.Busy.Contains(s.SessionId)))
                 return;
         }
-        _calls.Remove(call.CallId);
+        RemoveCall(call);
         deliveries.Add(new Delivery(call.Caller, signal with { ToSessionId = call.Caller.SessionId }));
         var elsewhere = new HollerSignal { Type = SignalType.AnsweredElsewhere, CallId = call.CallId };
         deliveries.AddRange(ringing.Where(s => s != from).Select(s => new Delivery(s, elsewhere)));
@@ -254,18 +306,41 @@ public sealed class HollerSignalRouter(IOptions<HollerOptions> options, ILogger<
             return;
         if (call.Caller == from)
         {
-            _calls.Remove(call.CallId);
+            RemoveCall(call);
             deliveries.AddRange(CalleeSessions(call).Select(s => new Delivery(s, signal)));
         }
         else if (call.CalleeSessionId == from.SessionId)
         {
-            _calls.Remove(call.CallId);
+            RemoveCall(call);
             deliveries.Add(new Delivery(call.Caller, signal));
         }
         else if (call.IsRinging && call.CalleeUserId == from.UserId)
         {
             Refuse(from, signal with { Type = SignalType.Decline }, deliveries);
         }
+    }
+
+    private async Task RingTimedOutAsync(Call call)
+    {
+        var deliveries = new List<Delivery>();
+        lock (_lock)
+        {
+            if (!call.IsRinging || !_calls.ContainsKey(call.CallId))
+                return;
+            var ringing = CalleeSessions(call).ToArray();
+            RemoveCall(call);
+            deliveries.Add(new Delivery(call.Caller, new HollerSignal { Type = SignalType.NoAnswer, CallId = call.CallId, FromUserId = call.CalleeUserId }));
+            var hangup = new HollerSignal { Type = SignalType.Hangup, CallId = call.CallId, FromUserId = call.Caller.UserId, FromSessionId = call.Caller.SessionId };
+            deliveries.AddRange(ringing.Select(s => new Delivery(s, hangup)));
+        }
+        await DeliverAsync(deliveries);
+    }
+
+    private void RemoveCall(Call call)
+    {
+        _calls.Remove(call.CallId);
+        call.RingTimer?.Dispose();
+        call.RingTimer = null;
     }
 
     /// <summary>The sessions a call reaches: the answering session once accepted, otherwise all of the callee's sessions except the caller's.</summary>

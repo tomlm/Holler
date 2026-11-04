@@ -64,21 +64,32 @@ To build your own UI, inject `HollerClient` (or inherit `HollerComponentBase`). 
 builder.Services.AddHoller(o =>
 {
     o.HubPath = "/holler";                       // must match AddHollerClient(o => o.HubPath = "holler")
-    o.IceServers =
-    [
-        new(["stun:stun.l.google.com:19302"]),
-        new(["turn:turn.example.com:3478"], "user", "secret"),   // needed for users behind strict NATs
-    ];
+    o.IceServers = [new(["stun:stun.l.google.com:19302"])];
+    o.Turn = new()                               // needed for users behind strict NATs
+    {
+        Urls = ["turn:turn.example.com:3478", "turns:turn.example.com:5349"],
+        SharedSecret = builder.Configuration["Turn:Secret"]!,   // coturn static-auth-secret
+        CredentialLifetime = TimeSpan.FromHours(12),
+    };
+    o.RingTimeout = TimeSpan.FromSeconds(45);    // then the caller gets "No answer"
     o.MaxRoomSize = 6;
+    o.Limits.RingsPerMinute = 10;                // per session; also SignalsPerSecond, MaxPayloadLength, MaxRoomsPerSession
     o.RequireAuthorization = true;               // false: anonymous users get a per-session guest id
 });
 ```
 
+`HollerOptions` binds from configuration as usual, e.g. `builder.Services.Configure<HollerOptions>(builder.Configuration.GetSection("Holler"))`.
+
+**TURN.** `Turn` uses coturn's shared-secret "TURN REST API" (`use-auth-secret`). Each user gets a credential
+that expires, derived from the secret. The secret itself never leaves the server. Clients re-fetch credentials before
+new connections once they are 10 minutes old.
+
 Extension points (register your own before `AddHoller`):
 
 - `IHollerUserIdProvider` decides the user id people call. The default is the `NameIdentifier` claim, falling back to `Identity.Name`.
-- `IIceServerProvider` supplies ICE servers per user, for example short-lived TURN credentials. Browsers fetch
-  them from the server, so TURN secrets never ship in WebAssembly code.
+- `IHollerAuthorizer` decides who may call whom (`CanCallAsync`) and join which room (`CanJoinRoomAsync`). The
+  default allows everything. A denied call looks to the caller like an offline user, so it reveals nothing.
+- `IIceServerProvider` replaces the ICE server list entirely, e.g. for a hosted TURN service with its own API.
 
 ## How it works
 
@@ -96,6 +107,7 @@ Extension points (register your own before `AddHoller`):
   Later renegotiation uses WebRTC "perfect negotiation".
 - **Trust:** the router stamps every signal with the authenticated sender. It only forwards SDP and ICE between
   sessions that share an accepted call or a room, and rejects server-only signal types sent by clients.
+  Per-session rate and size limits drop floods, and an unanswered call stops ringing after `RingTimeout`.
 - **Scale-out:** routing state is in memory, so all users must reach the same server instance (use sticky
   sessions or a single instance). A distributed router is future work.
 
