@@ -26,6 +26,10 @@ public sealed class HollerClient : IAsyncDisposable
     private readonly HashSet<string> _online = [];
     private readonly Dictionary<string, List<HollerChatMessage>> _messages = [];
 
+    // TURN credentials can expire, so re-fetch ICE servers before new connections once they get old.
+    private static readonly TimeSpan IceServerRefresh = TimeSpan.FromMinutes(10);
+    private DateTimeOffset _iceServersFetched;
+
     private Task? _started;
     private SynchronizationContext? _context;
     private HollerSessionInfo? _session;
@@ -108,6 +112,7 @@ public sealed class HollerClient : IAsyncDisposable
             _module = await _js.InvokeAsync<IJSObjectReference>("import", ModulePath);
             _callbacks = DotNetObjectReference.Create(new JsCallbacks(this));
             _engine = await _module.InvokeAsync<IJSObjectReference>("createEngine", _callbacks, iceServers);
+            _iceServersFetched = DateTimeOffset.UtcNow;
 
             var online = await _channel.GetOnlineUsersAsync();
             lock (_sync)
@@ -164,6 +169,7 @@ public sealed class HollerClient : IAsyncDisposable
     public async Task<HollerCall> CallAsync(string userId)
     {
         await StartAsync();
+        await RefreshIceServersAsync();
         HollerCall call;
         lock (_sync)
         {
@@ -184,6 +190,7 @@ public sealed class HollerClient : IAsyncDisposable
             return;
         foreach (var other in Calls.Where(c => c != call && c.State is HollerCallState.Connecting or HollerCallState.Connected))
             await HangupAsync(other);
+        await RefreshIceServersAsync();
 
         await Exclusive(() =>
         {
@@ -231,6 +238,7 @@ public sealed class HollerClient : IAsyncDisposable
     public async Task<HollerRoom> JoinRoomAsync(string name)
     {
         await StartAsync();
+        await RefreshIceServersAsync();
         HollerRoom room;
         lock (_sync)
         {
@@ -313,6 +321,22 @@ public sealed class HollerClient : IAsyncDisposable
         AddMessage(new HollerChatMessage(conversation, UserId ?? "", text, DateTimeOffset.Now, IsLocal: true));
     }
 
+    private async Task RefreshIceServersAsync()
+    {
+        if (_engine is null || DateTimeOffset.UtcNow - _iceServersFetched < IceServerRefresh)
+            return;
+        try
+        {
+            var iceServers = await _channel.GetIceServersAsync();
+            await _engine.InvokeVoidAsync("setIceServers", iceServers);
+            _iceServersFetched = DateTimeOffset.UtcNow;
+        }
+        catch (Exception ex) when (ex is not JSDisconnectedException)
+        {
+            _logger.LogWarning(ex, "Holler failed to refresh ICE servers; keeping the previous ones");
+        }
+    }
+
     internal async Task AttachAsync(ElementReference element, string streamKey, bool muted)
     {
         await StartAsync();
@@ -393,11 +417,14 @@ public sealed class HollerClient : IAsyncDisposable
             case SignalType.Unavailable when call is not null:
                 await EndCallAsync(call, "Unavailable");
                 break;
+            case SignalType.NoAnswer when call is not null:
+                await EndCallAsync(call, "No answer");
+                break;
             case SignalType.AnsweredElsewhere when call is not null:
                 await EndCallAsync(call, "Answered elsewhere");
                 break;
             case SignalType.Hangup when call is not null:
-                await EndCallAsync(call, "Remote hung up");
+                await EndCallAsync(call, call.State == HollerCallState.Ringing && call.Direction == HollerCallDirection.Incoming ? "Missed call" : "Remote hung up");
                 break;
 
             case SignalType.Description or SignalType.Ice:

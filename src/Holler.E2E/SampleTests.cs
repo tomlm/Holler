@@ -108,6 +108,22 @@ public class SampleTests
     }
 
     [Test]
+    public async Task Unanswered_call_times_out()
+    {
+        var a = await SignInAsync("hal");
+        var b = await SignInAsync("ida");
+        await a.Page.GotoAsync(Url("call/wasm"));
+        await b.Page.GotoAsync(Url("call/server"));
+
+        await RingAsync(a.Page, b.Name);
+        await IncomingButton(b.Page, "Accept").WaitForAsync(new() { Timeout = 15_000 });
+
+        var wait = SampleAppFixture.RingTimeout + TimeSpan.FromSeconds(10);
+        await a.Page.Locator(".holler-status", new() { HasText = "No answer" }).WaitForAsync(new() { Timeout = (float)wait.TotalMilliseconds });
+        await IncomingButton(b.Page, "Accept").WaitForAsync(new() { State = WaitForSelectorState.Detached, Timeout = 10_000 });
+    }
+
+    [Test]
     public async Task Answering_on_one_device_stops_the_other_ringing()
     {
         var a = await SignInAsync("fay");

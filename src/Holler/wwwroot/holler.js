@@ -6,16 +6,21 @@ const LOCAL = 'local';
 class Engine {
     constructor(dotnet, iceServers) {
         this.dotnet = dotnet;
+        this.setIceServers(iceServers);
+        this.localStream = null;
+        this.peers = new Map();   // key -> peer
+        this.streams = new Map(); // key -> MediaStream
+        this.views = new Map();   // key -> Set<HTMLMediaElement>
+    }
+
+    // Applies to peer connections created afterwards (e.g. refreshed TURN credentials).
+    setIceServers(iceServers) {
         this.iceServers = (iceServers || []).map(s => {
             const server = { urls: s.urls };
             if (s.username) server.username = s.username;
             if (s.credential) server.credential = s.credential;
             return server;
         });
-        this.localStream = null;
-        this.peers = new Map();   // key -> peer
-        this.streams = new Map(); // key -> MediaStream
-        this.views = new Map();   // key -> Set<HTMLMediaElement>
     }
 
     async startMedia(audio, video) {

@@ -1,6 +1,7 @@
 using Holler.Server;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
 
 namespace Holler.Tests;
 
@@ -17,14 +18,30 @@ public class RouterTests
         public IEnumerable<HollerSignal> Of(SignalType type) => Received.Where(s => s.Type == type);
     }
 
+    private sealed class FakeAuthorizer : IHollerAuthorizer
+    {
+        public HashSet<(string Caller, string Callee)> DeniedCalls { get; } = [];
+        public HashSet<string> DeniedRooms { get; } = [];
+        public ValueTask<bool> CanCallAsync(HollerPeerInfo caller, string calleeUserId) =>
+            ValueTask.FromResult(!DeniedCalls.Contains((caller.UserId, calleeUserId)));
+        public ValueTask<bool> CanJoinRoomAsync(HollerPeerInfo session, string room) =>
+            ValueTask.FromResult(!DeniedRooms.Contains(room));
+    }
+
     private HollerSignalRouter _router = null!;
+    private HollerOptions _options = null!;
+    private FakeTimeProvider _time = null!;
+    private FakeAuthorizer _authorizer = null!;
     private readonly Dictionary<string, FakeSink> _sinks = [];
 
     [SetUp]
     public void Setup()
     {
         _sinks.Clear();
-        _router = new HollerSignalRouter(Options.Create(new HollerOptions { MaxRoomSize = 3 }), NullLogger<HollerSignalRouter>.Instance);
+        _options = new HollerOptions { MaxRoomSize = 3 };
+        _time = new FakeTimeProvider(DateTimeOffset.Parse("2026-01-01T00:00:00Z"));
+        _authorizer = new FakeAuthorizer();
+        _router = new HollerSignalRouter(Options.Create(_options), _authorizer, _time, NullLogger<HollerSignalRouter>.Instance);
     }
 
     private async Task<FakeSink> Connect(string sessionId, string userId)
@@ -269,5 +286,140 @@ public class RouterTests
         await _router.UnregisterAsync("b1");
 
         Assert.That(a1.Of(SignalType.Unavailable).Single().CallId, Is.EqualTo("call1"));
+    }
+
+    [Test]
+    public async Task Unanswered_call_times_out_with_no_answer()
+    {
+        var a1 = await Connect("a1", "alice");
+        var b1 = await Connect("b1", "bob");
+        var b2 = await Connect("b2", "bob");
+        await Send("a1", SignalType.Ring, "call1", toUser: "bob");
+
+        _time.Advance(_options.RingTimeout - TimeSpan.FromSeconds(1));
+        Assert.That(a1.Of(SignalType.NoAnswer), Is.Empty);
+        _time.Advance(TimeSpan.FromSeconds(1));
+
+        Assert.That(a1.Of(SignalType.NoAnswer).Single().CallId, Is.EqualTo("call1"));
+        Assert.That(b1.Of(SignalType.Hangup).Count(), Is.EqualTo(1), "stops ringing");
+        Assert.That(b2.Of(SignalType.Hangup).Count(), Is.EqualTo(1), "stops ringing");
+
+        await Send("b1", SignalType.Accept, "call1", toSession: "a1");
+        Assert.That(a1.Of(SignalType.Accept), Is.Empty, "a timed-out call can no longer be accepted");
+    }
+
+    [Test]
+    public async Task Answered_call_does_not_time_out()
+    {
+        var a1 = await Connect("a1", "alice");
+        var b1 = await Connect("b1", "bob");
+        await Send("a1", SignalType.Ring, "call1", toUser: "bob");
+        await Send("b1", SignalType.Accept, "call1", toSession: "a1");
+
+        _time.Advance(TimeSpan.FromMinutes(5));
+
+        Assert.That(a1.Of(SignalType.NoAnswer), Is.Empty);
+        Assert.That(b1.Of(SignalType.Hangup), Is.Empty);
+        await Send("a1", SignalType.Description, "call1", toSession: "b1");
+        Assert.That(b1.Of(SignalType.Description).Count(), Is.EqualTo(1), "call still active");
+    }
+
+    [Test]
+    public async Task Zero_ring_timeout_rings_forever()
+    {
+        _options.RingTimeout = TimeSpan.Zero;
+        var a1 = await Connect("a1", "alice");
+        await Connect("b1", "bob");
+        await Send("a1", SignalType.Ring, "call1", toUser: "bob");
+
+        _time.Advance(TimeSpan.FromHours(1));
+
+        Assert.That(a1.Of(SignalType.NoAnswer), Is.Empty);
+    }
+
+    [Test]
+    public async Task Denied_call_looks_like_an_offline_user()
+    {
+        _authorizer.DeniedCalls.Add(("alice", "bob"));
+        var a1 = await Connect("a1", "alice");
+        var b1 = await Connect("b1", "bob");
+        b1.Received.Clear();
+
+        await Send("a1", SignalType.Ring, "call1", toUser: "bob");
+
+        Assert.That(a1.Of(SignalType.Unavailable).Single().CallId, Is.EqualTo("call1"));
+        Assert.That(b1.Received, Is.Empty);
+    }
+
+    [Test]
+    public async Task Denied_room_join_throws()
+    {
+        _authorizer.DeniedRooms.Add("vip");
+        await Connect("a1", "alice");
+        Assert.ThrowsAsync<HollerException>(() => _router.JoinRoomAsync("a1", "vip"));
+        Assert.That(await _router.JoinRoomAsync("a1", "lobby"), Is.Empty);
+    }
+
+    [Test]
+    public async Task Rings_are_rate_limited_per_session()
+    {
+        _options.Limits.RingsPerMinute = 2;
+        var a1 = await Connect("a1", "alice");
+        var b1 = await Connect("b1", "bob");
+        b1.Received.Clear();
+
+        for (var i = 0; i < 3; i++)
+            await Send("a1", SignalType.Ring, $"call{i}", toUser: "bob");
+
+        Assert.That(b1.Of(SignalType.Ring).Count(), Is.EqualTo(2));
+        Assert.That(a1.Of(SignalType.Unavailable).Single().CallId, Is.EqualTo("call2"));
+
+        _time.Advance(TimeSpan.FromMinutes(1));
+        await Send("a1", SignalType.Ring, "call3", toUser: "bob");
+        Assert.That(b1.Of(SignalType.Ring).Count(), Is.EqualTo(3), "window resets");
+    }
+
+    [Test]
+    public async Task Signals_are_rate_limited_per_session()
+    {
+        _options.Limits.SignalsPerSecond = 5;
+        await Connect("a1", "alice");
+        var b1 = await Connect("b1", "bob");
+        await _router.JoinRoomAsync("a1", "r");
+        await _router.JoinRoomAsync("b1", "r");
+
+        for (var i = 0; i < 8; i++)
+            await Send("a1", SignalType.Ice, toSession: "b1", room: "r");
+        Assert.That(b1.Of(SignalType.Ice).Count(), Is.EqualTo(5));
+
+        _time.Advance(TimeSpan.FromSeconds(1));
+        await Send("a1", SignalType.Ice, toSession: "b1", room: "r");
+        Assert.That(b1.Of(SignalType.Ice).Count(), Is.EqualTo(6), "window resets");
+    }
+
+    [Test]
+    public async Task Oversized_payloads_are_dropped()
+    {
+        _options.Limits.MaxPayloadLength = 10;
+        await Connect("a1", "alice");
+        var b1 = await Connect("b1", "bob");
+        await _router.JoinRoomAsync("a1", "r");
+        await _router.JoinRoomAsync("b1", "r");
+
+        await _router.RouteAsync("a1", new HollerSignal { Type = SignalType.Description, ToSessionId = "b1", Room = "r", Payload = new string('x', 11) });
+        await _router.RouteAsync("a1", new HollerSignal { Type = SignalType.Description, ToSessionId = "b1", Room = "r", Payload = new string('x', 10) });
+
+        Assert.That(b1.Of(SignalType.Description).Count(), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Rooms_per_session_are_limited()
+    {
+        _options.Limits.MaxRoomsPerSession = 2;
+        await Connect("a1", "alice");
+        await _router.JoinRoomAsync("a1", "r1");
+        await _router.JoinRoomAsync("a1", "r2");
+        Assert.ThrowsAsync<HollerException>(() => _router.JoinRoomAsync("a1", "r3"));
+        Assert.That(await _router.JoinRoomAsync("a1", "r1"), Is.Empty, "rejoining a room you are in is fine");
     }
 }

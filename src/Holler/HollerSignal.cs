@@ -27,6 +27,8 @@ public enum SignalType
     Unavailable,
     /// <summary>Server: a user came online or went offline. <see cref="HollerSignal.Payload"/> is "online" or "offline".</summary>
     PresenceChanged,
+    /// <summary>Server: the call rang until the ring timeout without being answered.</summary>
+    NoAnswer,
 }
 
 /// <summary>
@@ -47,7 +49,7 @@ public sealed record HollerSignal
     /// <summary>Signal types that only the server may originate.</summary>
     public static bool IsServerOnly(SignalType type) => type is
         SignalType.PeerJoined or SignalType.PeerLeft or SignalType.AnsweredElsewhere or
-        SignalType.Unavailable or SignalType.PresenceChanged;
+        SignalType.Unavailable or SignalType.PresenceChanged or SignalType.NoAnswer;
 }
 
 /// <summary>Identity of this client's signaling session.</summary>
