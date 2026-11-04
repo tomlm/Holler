@@ -14,12 +14,15 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
 builder.Services.AddAuthorization();
 builder.Services.AddCascadingAuthenticationState();
 
-// Holler: signaling hub + server-side HollerClient. Add a TURN server here for users behind strict NATs.
+// Holler: signaling hub + server-side HollerClient.
 builder.Services.AddHoller(o =>
 {
     o.IceServers = [new(["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"])];
     o.MaxRoomSize = 6;
 });
+// Anything can also come from configuration, e.g. a TURN server for users behind strict NATs:
+//   "Holler": { "RingTimeout": "00:00:30", "Turn": { "Urls": [ "turn:turn.example.com:3478" ], "SharedSecret": "..." } }
+builder.Services.Configure<Holler.Server.HollerOptions>(builder.Configuration.GetSection("Holler"));
 
 var app = builder.Build();
 

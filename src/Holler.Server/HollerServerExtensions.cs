@@ -18,7 +18,9 @@ public static class HollerServerExtensions
         var options = services.AddOptions<HollerOptions>();
         if (configure is not null)
             options.Configure(configure);
+        services.TryAddSingleton(TimeProvider.System);
         services.TryAddSingleton<HollerSignalRouter>();
+        services.TryAddSingleton<IHollerAuthorizer, AllowAllHollerAuthorizer>();
         services.TryAddSingleton<IHollerUserIdProvider, ClaimsHollerUserIdProvider>();
         services.TryAddSingleton<IIceServerProvider, OptionsIceServerProvider>();
         services.TryAddScoped<Holler.ISignalingChannel, InProcessSignalingChannel>();
