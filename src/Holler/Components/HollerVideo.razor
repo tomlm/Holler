@@ -1,0 +1,36 @@
+@implements IAsyncDisposable
+@inject HollerClient Holler
+
+<video @ref="_video" class="holler-video @Class" autoplay playsinline muted="@Local"></video>
+
+@code {
+    /// <summary>The remote peer whose stream to show.</summary>
+    [Parameter] public HollerPeer? Peer { get; set; }
+
+    /// <summary>Show the local camera instead of a peer (always muted).</summary>
+    [Parameter] public bool Local { get; set; }
+
+    [Parameter] public string? Class { get; set; }
+
+    private ElementReference _video;
+    private string? _attached;
+
+    private string? StreamKey => Local ? "local" : Peer?.Key;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (StreamKey == _attached)
+            return;
+        if (_attached is not null)
+            await Holler.DetachAsync(_video, _attached);
+        _attached = StreamKey;
+        if (_attached is not null)
+            await Holler.AttachAsync(_video, _attached, Local);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_attached is not null)
+            await Holler.DetachAsync(_video, _attached);
+    }
+}

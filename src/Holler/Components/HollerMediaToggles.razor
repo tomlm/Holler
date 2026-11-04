@@ -1,0 +1,14 @@
+@inherits HollerComponentBase
+
+<button type="button" class="holler-btn @(Holler.MicrophoneEnabled ? "" : "holler-off")"
+        title="@(Holler.MicrophoneEnabled ? "Mute microphone" : "Unmute microphone")"
+        disabled="@(Holler.LocalMedia is not { Audio: true })"
+        @onclick="() => Run(() => Holler.SetMicrophoneAsync(!Holler.MicrophoneEnabled))">
+    @(Holler.MicrophoneEnabled ? "Mute" : "Unmute")
+</button>
+<button type="button" class="holler-btn @(Holler.CameraEnabled ? "" : "holler-off")"
+        title="@(Holler.CameraEnabled ? "Turn camera off" : "Turn camera on")"
+        disabled="@(Holler.LocalMedia is not { Video: true })"
+        @onclick="() => Run(() => Holler.SetCameraAsync(!Holler.CameraEnabled))">
+    @(Holler.CameraEnabled ? "Camera off" : "Camera on")
+</button>

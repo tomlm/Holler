@@ -1,0 +1,112 @@
+@inherits HollerComponentBase
+
+<div class="holler-room @Class">
+    <div class="holler-grid">
+        @if (Holler.LocalMedia is { Video: true })
+        {
+            <div class="holler-tile holler-tile-local">
+                <HollerVideo Local="true" />
+                <span class="holler-tile-name">@(Holler.UserId) (you)</span>
+            </div>
+        }
+        @if (_room is not null)
+        {
+            @foreach (var peer in _room.Peers)
+            {
+                <div class="holler-tile" @key="peer.Key">
+                    <HollerVideo Peer="peer" />
+                    <span class="holler-tile-name">@peer.UserId@(peer.ConnectionState == "connected" ? "" : $" · {peer.ConnectionState}")</span>
+                </div>
+            }
+        }
+    </div>
+
+    @if (Error is not null || Holler.LocalMedia is { Ok: false })
+    {
+        <div class="holler-error">@(Error ?? Holler.LocalMedia?.Error)</div>
+    }
+
+    @if (ShowControls)
+    {
+        <div class="holler-controls">
+            @if (_room is not null)
+            {
+                <HollerMediaToggles />
+                <button type="button" class="holler-btn holler-danger" @onclick="() => Run(LeaveAsync)">Leave</button>
+            }
+            else
+            {
+                <button type="button" class="holler-btn holler-primary" disabled="@(!Holler.IsStarted)"
+                        @onclick="() => Run(JoinAsync)">Join @Name</button>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    /// <summary>Room name. Everyone who joins the same name is connected peer-to-peer (full mesh, keep it small).</summary>
+    [Parameter, EditorRequired] public string Name { get; set; } = "";
+
+    [Parameter] public bool AutoJoin { get; set; } = true;
+    [Parameter] public bool Audio { get; set; } = true;
+    [Parameter] public bool Video { get; set; } = true;
+    [Parameter] public bool ShowControls { get; set; } = true;
+    [Parameter] public bool LeaveOnDispose { get; set; } = true;
+    [Parameter] public string? Class { get; set; }
+
+    private HollerRoom? _room;
+    private string? _joined;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        // Switching rooms while shown.
+        if (_joined is not null && _joined != Name)
+        {
+            await LeaveAsync();
+            if (AutoJoin)
+                await Run(JoinAsync);
+        }
+    }
+
+    protected override async Task OnHollerStartedAsync()
+    {
+        _room = Holler.GetRoom(Name);
+        if (_room is null && AutoJoin)
+            await JoinAsync();
+    }
+
+    protected override void OnHollerStateChanged() => _room = Holler.GetRoom(Name);
+
+    private async Task JoinAsync()
+    {
+        await Holler.StartMediaAsync(Audio, Video);
+        _joined = Name;
+        _room = await Holler.JoinRoomAsync(Name);
+    }
+
+    private async Task LeaveAsync()
+    {
+        if (_joined is { } name)
+        {
+            _joined = null;
+            _room = null;
+            await Holler.LeaveRoomAsync(name);
+        }
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        await base.DisposeAsync();
+        if (LeaveOnDispose)
+        {
+            try
+            {
+                await LeaveAsync();
+            }
+            catch
+            {
+                // The circuit or connection may already be gone.
+            }
+        }
+    }
+}

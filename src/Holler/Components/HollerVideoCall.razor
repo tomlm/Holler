@@ -1,0 +1,130 @@
+@inherits HollerComponentBase
+
+<div class="holler-call @Class">
+    <div class="holler-stage">
+        @if (_call is { IsActive: true, Peer: { } peer })
+        {
+            <HollerVideo Peer="peer" />
+        }
+        @if (_call?.Peer is not { HasVideo: true } || !_call.IsActive)
+        {
+            <div class="holler-placeholder">@UserId</div>
+        }
+        <div class="holler-status">@Status</div>
+        @if (ShowLocalPreview && Holler.LocalMedia is { Video: true })
+        {
+            <div class="holler-pip"><HollerVideo Local="true" /></div>
+        }
+    </div>
+
+    @if (Error is not null || Holler.LocalMedia is { Ok: false })
+    {
+        <div class="holler-error">@(Error ?? Holler.LocalMedia?.Error)</div>
+    }
+
+    @if (ShowControls)
+    {
+        <div class="holler-controls">
+            @if (_call is { Direction: HollerCallDirection.Incoming, State: HollerCallState.Ringing } ringing)
+            {
+                <button type="button" class="holler-btn holler-accept" @onclick="() => Run(() => AcceptAsync(ringing))">Accept</button>
+                <button type="button" class="holler-btn holler-danger" @onclick="() => Run(() => Holler.DeclineAsync(ringing))">Decline</button>
+            }
+            else if (_call is { IsActive: true } active)
+            {
+                <HollerMediaToggles />
+                <button type="button" class="holler-btn holler-danger" @onclick="() => Run(() => Holler.HangupAsync(active))">Hang up</button>
+            }
+            else
+            {
+                <button type="button" class="holler-btn holler-primary" disabled="@(!Holler.IsStarted)"
+                        @onclick="() => Run(StartCallAsync)">Call @UserId</button>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    /// <summary>The user to show a video call with.</summary>
+    [Parameter, EditorRequired] public string UserId { get; set; } = "";
+
+    /// <summary>Ring the user as soon as the component is shown (unless a call with them is already active).</summary>
+    [Parameter] public bool AutoStart { get; set; }
+
+    [Parameter] public bool Audio { get; set; } = true;
+    [Parameter] public bool Video { get; set; } = true;
+    [Parameter] public bool ShowControls { get; set; } = true;
+    [Parameter] public bool ShowLocalPreview { get; set; } = true;
+
+    /// <summary>Hang up the call when this component is removed.</summary>
+    [Parameter] public bool HangupOnDispose { get; set; } = true;
+
+    [Parameter] public EventCallback<HollerCall> OnEnded { get; set; }
+    [Parameter] public string? Class { get; set; }
+
+    private HollerCall? _call;
+
+    private string Status => _call switch
+    {
+        null => Holler.IsStarted ? (Holler.OnlineUsers.Contains(UserId) ? "Online" : "Offline") : "Connecting…",
+        { State: HollerCallState.Ringing, Direction: HollerCallDirection.Outgoing } => $"Calling {UserId}…",
+        { State: HollerCallState.Ringing } => $"{UserId} is calling",
+        { State: HollerCallState.Connecting } => "Connecting…",
+        { State: HollerCallState.Connected } => "Connected",
+        { EndReason: { } reason } => $"Call ended: {reason}",
+        _ => "Call ended",
+    };
+
+    protected override void OnParametersSet()
+    {
+        if (_call is not null && _call.RemoteUserId != UserId)
+            _call = null;
+        if (Holler.IsStarted)
+            _call = Holler.GetCall(UserId) ?? _call;
+    }
+
+    protected override async Task OnHollerStartedAsync()
+    {
+        _call = Holler.GetCall(UserId);
+        if (_call is { IsActive: true })
+            await Holler.StartMediaAsync(Audio, Video);
+        else if (AutoStart)
+            await StartCallAsync();
+    }
+
+    protected override void OnHollerStateChanged()
+    {
+        var wasActive = _call?.IsActive == true;
+        _call = Holler.GetCall(UserId) ?? _call;
+        if (wasActive && _call is { IsActive: false })
+            _ = InvokeAsync(() => OnEnded.InvokeAsync(_call));
+    }
+
+    private async Task StartCallAsync()
+    {
+        await Holler.StartMediaAsync(Audio, Video);
+        _call = await Holler.CallAsync(UserId);
+    }
+
+    private async Task AcceptAsync(HollerCall call)
+    {
+        await Holler.StartMediaAsync(Audio, Video);
+        await Holler.AcceptAsync(call);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        await base.DisposeAsync();
+        if (HangupOnDispose && _call is { IsActive: true } call)
+        {
+            try
+            {
+                await Holler.HangupAsync(call);
+            }
+            catch
+            {
+                // The circuit or connection may already be gone.
+            }
+        }
+    }
+}

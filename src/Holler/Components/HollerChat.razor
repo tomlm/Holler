@@ -1,0 +1,54 @@
+@inherits HollerComponentBase
+
+<div class="holler-chat @Class">
+    <div class="holler-chat-log">
+        @{ var messages = Conversation is null ? [] : Holler.GetMessages(Conversation); }
+        @if (messages.Count == 0)
+        {
+            <span class="holler-chat-empty">@(CanSend ? "No messages yet." : Room is not null ? "Join the room to chat." : "Chat opens when the call connects.")</span>
+        }
+        @foreach (var message in messages)
+        {
+            <div class="holler-chat-msg @(message.IsLocal ? "holler-local" : "")">
+                <div class="holler-chat-from">@(message.IsLocal ? "You" : message.FromUserId)</div>
+                <span class="holler-chat-text">@message.Text</span>
+            </div>
+        }
+    </div>
+    <form class="holler-chat-form" @onsubmit="SendAsync" @onsubmit:preventDefault>
+        <input @bind="_draft" placeholder="Message" disabled="@(!CanSend)" aria-label="Message" />
+        <button type="submit" class="holler-btn holler-primary" disabled="@(!CanSend)">Send</button>
+    </form>
+</div>
+
+@code {
+    /// <summary>Chat with the user you are in a call with. Set this or <see cref="Room"/>.</summary>
+    [Parameter] public string? UserId { get; set; }
+
+    /// <summary>Chat with everyone in a joined room.</summary>
+    [Parameter] public string? Room { get; set; }
+
+    [Parameter] public string? Class { get; set; }
+
+    private string _draft = "";
+
+    private string? Conversation =>
+        Room is not null ? HollerClient.RoomConversation(Room) :
+        UserId is not null ? HollerClient.CallConversation(UserId) : null;
+
+    private bool CanSend => Holler.IsStarted && (Room is not null
+        ? Holler.GetRoom(Room) is not null
+        : UserId is not null && Holler.GetCall(UserId)?.Peer is { DataChannelOpen: true });
+
+    private async Task SendAsync()
+    {
+        var text = _draft.Trim();
+        if (text.Length == 0 || !CanSend)
+            return;
+        _draft = "";
+        if (Room is not null)
+            await Run(() => Holler.SendMessageAsync(Room, text));
+        else if (UserId is not null && Holler.GetCall(UserId) is { } call)
+            await Run(() => Holler.SendMessageAsync(call, text));
+    }
+}

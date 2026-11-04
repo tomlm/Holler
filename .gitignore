@@ -426,3 +426,6 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# The VS template's *.e2e rule matches this folder on case-insensitive file systems.
+!Holler.E2E/

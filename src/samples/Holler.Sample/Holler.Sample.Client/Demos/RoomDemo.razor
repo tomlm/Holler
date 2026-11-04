@@ -1,0 +1,22 @@
+<form class="d-flex gap-2 mb-3" style="max-width: 24rem" @onsubmit="() => _room = _draft.Trim()" @onsubmit:preventDefault>
+    <input class="form-control" @bind="_draft" aria-label="Room name" />
+    <button class="btn btn-primary" type="submit">Switch room</button>
+</form>
+
+@if (!string.IsNullOrEmpty(_room))
+{
+    <div class="row g-4">
+        <div class="col-lg-8">
+            <HollerVideoRoom @key="_room" Name="@_room" />
+        </div>
+        <div class="col-lg-4">
+            <h5>Room chat</h5>
+            <HollerChat @key="_room" Room="@_room" />
+        </div>
+    </div>
+}
+
+@code {
+    private string _room = "lobby";
+    private string _draft = "lobby";
+}

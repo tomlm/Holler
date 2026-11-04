@@ -1,0 +1,692 @@
+using System.Text.Json;
+using Microsoft.AspNetCore.Components;
+using Microsoft.Extensions.Logging;
+using Microsoft.JSInterop;
+
+namespace Holler;
+
+/// <summary>
+/// The Holler client API: place and answer 1:1 calls, join rooms, toggle media and chat.
+/// Register with <c>AddHollerClient()</c> (WebAssembly) or <c>AddHoller()</c> (server); it is scoped,
+/// so there is one per browser tab / circuit. The Holler components use it for you.
+/// </summary>
+public sealed class HollerClient : IAsyncDisposable
+{
+    private const string ModulePath = "./_content/Holler/holler.js";
+
+    private readonly ISignalingChannel _channel;
+    private readonly IJSRuntime _js;
+    private readonly ILogger<HollerClient> _logger;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly object _sync = new();
+
+    private readonly Dictionary<string, HollerCall> _calls = [];
+    private readonly Dictionary<string, HollerPeer> _peers = [];
+    private readonly Dictionary<string, HollerRoom> _rooms = [];
+    private readonly HashSet<string> _online = [];
+    private readonly Dictionary<string, List<HollerChatMessage>> _messages = [];
+
+    private Task? _started;
+    private SynchronizationContext? _context;
+    private HollerSessionInfo? _session;
+    private IJSObjectReference? _module;
+    private IJSObjectReference? _engine;
+    private DotNetObjectReference<JsCallbacks>? _callbacks;
+    private bool _disposed;
+
+    public HollerClient(ISignalingChannel channel, IJSRuntime js, ILogger<HollerClient> logger)
+    {
+        _channel = channel;
+        _js = js;
+        _logger = logger;
+    }
+
+    /// <summary>Raised whenever calls, rooms, peers, presence or messages change.</summary>
+    public event Action? Changed;
+
+    /// <summary>Raised when another user rings this session.</summary>
+    public event Action<HollerCall>? IncomingCall;
+
+    public event Action<HollerChatMessage>? MessageReceived;
+
+    public bool IsStarted => _engine is not null;
+    public string? UserId => _session?.UserId;
+    public string? SessionId => _session?.SessionId;
+
+    public HollerMediaResult? LocalMedia { get; private set; }
+    public bool MicrophoneEnabled { get; private set; } = true;
+    public bool CameraEnabled { get; private set; } = true;
+
+    public IReadOnlyList<HollerCall> Calls { get { lock (_sync) return _calls.Values.ToArray(); } }
+    public IReadOnlyList<HollerRoom> Rooms { get { lock (_sync) return _rooms.Values.ToArray(); } }
+    public IReadOnlyList<string> OnlineUsers { get { lock (_sync) return _online.Order().ToArray(); } }
+
+    /// <summary>The first call that is ringing this session, if any.</summary>
+    public HollerCall? RingingCall
+    {
+        get { lock (_sync) return _calls.Values.FirstOrDefault(c => c.Direction == HollerCallDirection.Incoming && c.State == HollerCallState.Ringing); }
+    }
+
+    /// <summary>The active (not ended) call with a user, if any.</summary>
+    public HollerCall? GetCall(string userId)
+    {
+        lock (_sync) return _calls.Values.FirstOrDefault(c => c.RemoteUserId == userId && c.IsActive);
+    }
+
+    public HollerRoom? GetRoom(string name)
+    {
+        lock (_sync) return _rooms.GetValueOrDefault(name);
+    }
+
+    public static string CallConversation(string userId) => $"user:{userId}";
+    public static string RoomConversation(string room) => $"room:{room}";
+
+    public IReadOnlyList<HollerChatMessage> GetMessages(string conversation)
+    {
+        lock (_sync) return _messages.TryGetValue(conversation, out var list) ? list.ToArray() : [];
+    }
+
+    /// <summary>Connects to the signaling hub and loads the WebRTC engine. Safe to call repeatedly.</summary>
+    public Task StartAsync()
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _started ??= StartCoreAsync();
+        }
+    }
+
+    private async Task StartCoreAsync()
+    {
+        try
+        {
+            // Signals arrive on background threads; marshal them back to the caller's context
+            // (the Blazor Server circuit's renderer, or the WebAssembly main thread).
+            _context = SynchronizationContext.Current;
+            _session = await _channel.StartAsync();
+            var iceServers = await _channel.GetIceServersAsync();
+            _module = await _js.InvokeAsync<IJSObjectReference>("import", ModulePath);
+            _callbacks = DotNetObjectReference.Create(new JsCallbacks(this));
+            _engine = await _module.InvokeAsync<IJSObjectReference>("createEngine", _callbacks, iceServers);
+
+            var online = await _channel.GetOnlineUsersAsync();
+            lock (_sync)
+            {
+                _online.Clear();
+                _online.UnionWith(online);
+            }
+            _channel.SignalReceived += OnSignalReceived;
+            _channel.SessionChanged += OnSessionChanged;
+            NotifyChanged();
+        }
+        catch
+        {
+            lock (_sync) _started = null;
+            throw;
+        }
+    }
+
+    /// <summary>Requests the camera and/or microphone. Falls back to audio only if the camera is unavailable.</summary>
+    public async Task<HollerMediaResult> StartMediaAsync(bool audio = true, bool video = true)
+    {
+        await StartAsync();
+        if (LocalMedia is { Ok: true })
+            return LocalMedia;
+        var result = await Exclusive(async () =>
+            await _engine!.InvokeAsync<HollerMediaResult>("startMedia", audio, video));
+        LocalMedia = result;
+        if (result.Ok)
+        {
+            await SetMicrophoneAsync(MicrophoneEnabled);
+            await SetCameraAsync(CameraEnabled);
+        }
+        NotifyChanged();
+        return result;
+    }
+
+    public async Task SetMicrophoneAsync(bool enabled)
+    {
+        MicrophoneEnabled = enabled;
+        if (_engine is not null)
+            await _engine.InvokeVoidAsync("setTrackEnabled", "audio", enabled);
+        NotifyChanged();
+    }
+
+    public async Task SetCameraAsync(bool enabled)
+    {
+        CameraEnabled = enabled;
+        if (_engine is not null)
+            await _engine.InvokeVoidAsync("setTrackEnabled", "video", enabled);
+        NotifyChanged();
+    }
+
+    /// <summary>Rings every session of <paramref name="userId"/>. Returns the existing call if one is active.</summary>
+    public async Task<HollerCall> CallAsync(string userId)
+    {
+        await StartAsync();
+        HollerCall call;
+        lock (_sync)
+        {
+            if (GetCall(userId) is { } existing)
+                return existing;
+            call = new HollerCall(Guid.NewGuid().ToString("N"), userId, HollerCallDirection.Outgoing);
+            _calls[call.CallId] = call;
+        }
+        NotifyChanged();
+        await _channel.SendAsync(new HollerSignal { Type = SignalType.Ring, CallId = call.CallId, ToUserId = userId });
+        return call;
+    }
+
+    /// <summary>Accepts a ringing call. Any other active call is hung up first.</summary>
+    public async Task AcceptAsync(HollerCall call)
+    {
+        if (call.Direction != HollerCallDirection.Incoming || call.State != HollerCallState.Ringing)
+            return;
+        foreach (var other in Calls.Where(c => c != call && c.State is HollerCallState.Connecting or HollerCallState.Connected))
+            await HangupAsync(other);
+
+        await Exclusive(() =>
+        {
+            lock (_sync)
+            {
+                call.State = HollerCallState.Connecting;
+                call.Peer = AddPeer(new HollerPeer(call.RemoteSessionId!, call.RemoteUserId, call.CallId, null));
+            }
+            return Task.CompletedTask;
+        });
+        NotifyChanged();
+        // The caller creates the offer once it sees our Accept.
+        await _channel.SendAsync(new HollerSignal { Type = SignalType.Accept, CallId = call.CallId, ToSessionId = call.RemoteSessionId });
+    }
+
+    public async Task DeclineAsync(HollerCall call)
+    {
+        if (call.Direction != HollerCallDirection.Incoming || call.State != HollerCallState.Ringing)
+            return;
+        await Exclusive(() => EndCallAsync(call, "Declined"));
+        await _channel.SendAsync(new HollerSignal { Type = SignalType.Decline, CallId = call.CallId, ToSessionId = call.RemoteSessionId });
+    }
+
+    /// <summary>Ends (or cancels) a call.</summary>
+    public async Task HangupAsync(HollerCall call)
+    {
+        if (!call.IsActive)
+            return;
+        if (call.Direction == HollerCallDirection.Incoming && call.State == HollerCallState.Ringing)
+        {
+            await DeclineAsync(call);
+            return;
+        }
+        await Exclusive(() => EndCallAsync(call, "Hung up"));
+        await _channel.SendAsync(new HollerSignal
+        {
+            Type = SignalType.Hangup,
+            CallId = call.CallId,
+            ToUserId = call.RemoteUserId,
+            ToSessionId = call.RemoteSessionId,
+        });
+    }
+
+    /// <summary>Joins a room and connects to every session already in it.</summary>
+    public async Task<HollerRoom> JoinRoomAsync(string name)
+    {
+        await StartAsync();
+        HollerRoom room;
+        lock (_sync)
+        {
+            if (_rooms.TryGetValue(name, out var existing))
+                return existing;
+            // Registered before joining so PeerJoined signals racing the join are not lost.
+            room = new HollerRoom(name);
+            _rooms[name] = room;
+        }
+
+        IReadOnlyList<HollerPeerInfo> members;
+        try
+        {
+            members = await _channel.JoinRoomAsync(name);
+        }
+        catch
+        {
+            lock (_sync) _rooms.Remove(name);
+            NotifyChanged();
+            throw;
+        }
+
+        // The joiner offers to every existing member, so there is never offer glare on join.
+        await Exclusive(async () =>
+        {
+            foreach (var member in members)
+            {
+                HollerPeer peer;
+                lock (_sync)
+                {
+                    if (!_rooms.ContainsKey(name))
+                        return;
+                    peer = AddPeer(new HollerPeer(member.SessionId, member.UserId, null, name));
+                    room.PeerList.Add(peer);
+                }
+                await CreateJsPeerAsync(peer, initiator: true);
+            }
+        });
+        NotifyChanged();
+        return room;
+    }
+
+    public async Task LeaveRoomAsync(string name)
+    {
+        HollerRoom? room;
+        lock (_sync)
+        {
+            if (!_rooms.Remove(name, out room))
+                return;
+        }
+        await Exclusive(async () =>
+        {
+            foreach (var peer in room.PeerList.ToArray())
+                await ClosePeerAsync(peer);
+            room.PeerList.Clear();
+        });
+        NotifyChanged();
+        await _channel.LeaveRoomAsync(name);
+    }
+
+    /// <summary>Sends a chat message to the other side of a call.</summary>
+    public Task SendMessageAsync(HollerCall call, string text) =>
+        call.Peer is { } peer
+            ? SendDataAsync([peer], null, CallConversation(call.RemoteUserId), text)
+            : Task.CompletedTask;
+
+    /// <summary>Sends a chat message to everyone in a room.</summary>
+    public Task SendMessageAsync(string room, string text) =>
+        GetRoom(room) is { } r
+            ? SendDataAsync(r.Peers, room, RoomConversation(room), text)
+            : Task.CompletedTask;
+
+    private async Task SendDataAsync(IEnumerable<HollerPeer> peers, string? room, string conversation, string text)
+    {
+        if (_engine is null || string.IsNullOrWhiteSpace(text))
+            return;
+        var json = JsonSerializer.Serialize(new DataMessage(room, text));
+        foreach (var peer in peers)
+            await _engine.InvokeAsync<bool>("sendData", peer.Key, json);
+        AddMessage(new HollerChatMessage(conversation, UserId ?? "", text, DateTimeOffset.Now, IsLocal: true));
+    }
+
+    internal async Task AttachAsync(ElementReference element, string streamKey, bool muted)
+    {
+        await StartAsync();
+        await _engine!.InvokeVoidAsync("attach", element, streamKey, muted);
+    }
+
+    internal async Task DetachAsync(ElementReference element, string streamKey)
+    {
+        if (_engine is null)
+            return;
+        try
+        {
+            await _engine.InvokeVoidAsync("detach", element, streamKey);
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+    }
+
+    // ---- incoming signals ----
+
+    private Task OnSignalReceived(HollerSignal signal) => Exclusive(async () =>
+    {
+        try
+        {
+            await HandleSignalAsync(signal);
+        }
+        catch (Exception ex) when (ex is not JSDisconnectedException)
+        {
+            _logger.LogWarning(ex, "Holler failed to handle {Type} signal", signal.Type);
+        }
+        NotifyChanged();
+    });
+
+    private async Task HandleSignalAsync(HollerSignal s)
+    {
+        var from = s.FromSessionId ?? "";
+        HollerCall? call = null;
+        if (s.CallId is not null)
+            lock (_sync) call = _calls.GetValueOrDefault(s.CallId);
+
+        switch (s.Type)
+        {
+            case SignalType.Ring when s.CallId is not null && s.FromUserId is not null:
+                bool busy;
+                lock (_sync)
+                {
+                    busy = _calls.Values.Any(c => c.State is HollerCallState.Connecting or HollerCallState.Connected);
+                    if (!busy)
+                    {
+                        call = new HollerCall(s.CallId, s.FromUserId, HollerCallDirection.Incoming) { RemoteSessionId = from };
+                        _calls[call.CallId] = call;
+                    }
+                }
+                if (busy)
+                    await _channel.SendAsync(new HollerSignal { Type = SignalType.Busy, CallId = s.CallId, ToSessionId = from });
+                else
+                    IncomingCall?.Invoke(call!);
+                break;
+
+            case SignalType.Accept when call is { Direction: HollerCallDirection.Outgoing, State: HollerCallState.Ringing }:
+                HollerPeer peer;
+                lock (_sync)
+                {
+                    call.RemoteSessionId = from;
+                    call.State = HollerCallState.Connecting;
+                    peer = call.Peer = AddPeer(new HollerPeer(from, call.RemoteUserId, call.CallId, null));
+                }
+                await CreateJsPeerAsync(peer, initiator: true);
+                break;
+
+            case SignalType.Decline when call is not null:
+                await EndCallAsync(call, "Declined");
+                break;
+            case SignalType.Busy when call is not null:
+                await EndCallAsync(call, "Busy");
+                break;
+            case SignalType.Unavailable when call is not null:
+                await EndCallAsync(call, "Unavailable");
+                break;
+            case SignalType.AnsweredElsewhere when call is not null:
+                await EndCallAsync(call, "Answered elsewhere");
+                break;
+            case SignalType.Hangup when call is not null:
+                await EndCallAsync(call, "Remote hung up");
+                break;
+
+            case SignalType.Description or SignalType.Ice:
+                var key = s.CallId is not null ? $"call:{s.CallId}:{from}" : $"room:{s.Room}:{from}";
+                HollerPeer? target;
+                lock (_sync) target = _peers.GetValueOrDefault(key);
+                if (target is null || _engine is null)
+                    return;
+                if (!target.Created)
+                    await CreateJsPeerAsync(target, initiator: false);
+                await _engine.InvokeVoidAsync("signal", key, s.Type == SignalType.Description ? "description" : "ice", s.Payload);
+                break;
+
+            case SignalType.PeerJoined when s.Room is not null && s.FromUserId is not null:
+                lock (_sync)
+                {
+                    if (_rooms.TryGetValue(s.Room, out var room) && !_peers.ContainsKey($"room:{s.Room}:{from}"))
+                        room.PeerList.Add(AddPeer(new HollerPeer(from, s.FromUserId, null, s.Room)));
+                }
+                break;
+
+            case SignalType.PeerLeft when s.Room is not null:
+                HollerPeer? left = null;
+                lock (_sync)
+                {
+                    if (_rooms.TryGetValue(s.Room, out var room))
+                    {
+                        left = room.PeerList.FirstOrDefault(p => p.SessionId == from);
+                        if (left is not null)
+                            room.PeerList.Remove(left);
+                    }
+                }
+                if (left is not null)
+                    await ClosePeerAsync(left);
+                break;
+
+            case SignalType.PresenceChanged when s.FromUserId is not null:
+                lock (_sync)
+                {
+                    if (s.Payload == "offline")
+                        _online.Remove(s.FromUserId);
+                    else
+                        _online.Add(s.FromUserId);
+                }
+                break;
+        }
+    }
+
+    private async Task OnSessionChanged(HollerSessionInfo session) => await Exclusive(async () =>
+    {
+        // A reconnect gives us a new session; the server already dropped the old one,
+        // so tear everything down and rejoin rooms.
+        _session = session;
+        string[] roomNames;
+        lock (_sync) roomNames = _rooms.Keys.ToArray();
+        foreach (var call in Calls)
+            await EndCallAsync(call, "Connection lost");
+        foreach (var peer in _peers.Values.ToArray())
+            await ClosePeerAsync(peer);
+        lock (_sync) _rooms.Clear();
+        NotifyChanged();
+        _ = Task.Run(async () =>
+        {
+            foreach (var name in roomNames)
+            {
+                try
+                {
+                    await Post(() => JoinRoomAsync(name));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Holler failed to rejoin room {Room}", name);
+                }
+            }
+        });
+    });
+
+    // ---- callbacks from holler.js ----
+
+    private async Task OnLocalSignalAsync(string key, string type, string payload)
+    {
+        HollerPeer? peer;
+        lock (_sync) peer = _peers.GetValueOrDefault(key);
+        if (peer is null)
+            return;
+        await _channel.SendAsync(new HollerSignal
+        {
+            Type = type == "ice" ? SignalType.Ice : SignalType.Description,
+            CallId = peer.CallId,
+            Room = peer.Room,
+            ToSessionId = peer.SessionId,
+            Payload = payload,
+        });
+    }
+
+    private Task OnPeerStateAsync(string key, string state) => Exclusive(async () =>
+    {
+        HollerPeer? peer;
+        HollerCall? call = null;
+        lock (_sync)
+        {
+            peer = _peers.GetValueOrDefault(key);
+            if (peer is null)
+                return;
+            if (state == "datachannel-open")
+                peer.DataChannelOpen = true;
+            else
+                peer.ConnectionState = state;
+            if (peer.CallId is not null)
+                call = _calls.GetValueOrDefault(peer.CallId);
+            if (call is not null && state == "connected")
+                call.State = HollerCallState.Connected;
+        }
+        if (call is not null && state is "failed" or "closed")
+        {
+            await EndCallAsync(call, "Connection lost");
+            await _channel.SendAsync(new HollerSignal { Type = SignalType.Hangup, CallId = call.CallId, ToSessionId = call.RemoteSessionId });
+        }
+        NotifyChanged();
+    });
+
+    private Task OnRemoteTrackAsync(string key, string kind) => Post(() =>
+    {
+        lock (_sync)
+        {
+            if (_peers.GetValueOrDefault(key) is { } peer)
+            {
+                if (kind == "video") peer.HasVideo = true;
+                else peer.HasAudio = true;
+            }
+        }
+        NotifyChanged();
+        return Task.CompletedTask;
+    });
+
+    private Task OnDataAsync(string key, string json) => Post(() =>
+    {
+        HollerPeer? peer;
+        lock (_sync) peer = _peers.GetValueOrDefault(key);
+        DataMessage? data = null;
+        try
+        {
+            data = JsonSerializer.Deserialize<DataMessage>(json);
+        }
+        catch (JsonException)
+        {
+        }
+        if (peer is null || data?.Text is null)
+            return Task.CompletedTask;
+        var conversation = peer.Room is not null ? RoomConversation(peer.Room) : CallConversation(peer.UserId);
+        var message = new HollerChatMessage(conversation, peer.UserId, data.Text, DateTimeOffset.Now, IsLocal: false);
+        AddMessage(message);
+        MessageReceived?.Invoke(message);
+        return Task.CompletedTask;
+    });
+
+    // ---- helpers (call with _gate held unless noted) ----
+
+    private HollerPeer AddPeer(HollerPeer peer)
+    {
+        // caller holds _sync
+        _peers[peer.Key] = peer;
+        return peer;
+    }
+
+    private async Task CreateJsPeerAsync(HollerPeer peer, bool initiator)
+    {
+        if (peer.Created || _engine is null)
+            return;
+        peer.Created = true;
+        // Perfect negotiation needs exactly one polite side; break the tie on session id.
+        var polite = string.CompareOrdinal(SessionId, peer.SessionId) > 0;
+        await _engine.InvokeVoidAsync("createPeer", peer.Key, polite, initiator);
+    }
+
+    private async Task ClosePeerAsync(HollerPeer peer)
+    {
+        lock (_sync) _peers.Remove(peer.Key);
+        if (peer.Created && _engine is not null)
+            await _engine.InvokeVoidAsync("closePeer", peer.Key);
+    }
+
+    private async Task EndCallAsync(HollerCall call, string reason)
+    {
+        lock (_sync)
+        {
+            if (!_calls.Remove(call.CallId))
+                return;
+            call.State = HollerCallState.Ended;
+            call.EndReason = reason;
+        }
+        if (call.Peer is { } peer)
+            await ClosePeerAsync(peer);
+        NotifyChanged();
+    }
+
+    private void AddMessage(HollerChatMessage message)
+    {
+        lock (_sync)
+        {
+            if (!_messages.TryGetValue(message.Conversation, out var list))
+                _messages[message.Conversation] = list = [];
+            list.Add(message);
+        }
+        NotifyChanged();
+    }
+
+    private void NotifyChanged() => Changed?.Invoke();
+
+    /// <summary>Runs <paramref name="work"/> on the client's context, serialized with all other state changes.</summary>
+    private Task Exclusive(Func<Task> work) => Post(async () =>
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            await work();
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    });
+
+    private async Task<T> Exclusive<T>(Func<Task<T>> work)
+    {
+        T result = default!;
+        // Statement body so this binds to the non-generic overload instead of recursing.
+        await Exclusive(async () => { result = await work(); });
+        return result;
+    }
+
+    private Task Post(Func<Task> work)
+    {
+        var context = _context;
+        if (context is null || SynchronizationContext.Current == context)
+            return work();
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        context.Post(async _ =>
+        {
+            try
+            {
+                await work();
+                tcs.SetResult();
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
+            }
+        }, null);
+        return tcs.Task;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        lock (_sync)
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+        }
+        _channel.SignalReceived -= OnSignalReceived;
+        _channel.SessionChanged -= OnSessionChanged;
+        try
+        {
+            foreach (var call in Calls)
+                await _channel.SendAsync(new HollerSignal { Type = SignalType.Hangup, CallId = call.CallId, ToUserId = call.RemoteUserId, ToSessionId = call.RemoteSessionId });
+            if (_engine is not null)
+            {
+                await _engine.InvokeVoidAsync("dispose");
+                await _engine.DisposeAsync();
+            }
+            if (_module is not null)
+                await _module.DisposeAsync();
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or ObjectDisposedException or InvalidOperationException or TaskCanceledException)
+        {
+            // Browser or connection already gone.
+        }
+        _callbacks?.Dispose();
+    }
+
+    private sealed record DataMessage(string? Room, string Text);
+
+    /// <summary>Target for callbacks from holler.js; kept separate so <see cref="HollerClient"/> has no public JSInvokable surface.</summary>
+    private sealed class JsCallbacks(HollerClient client)
+    {
+        [JSInvokable] public Task OnLocalSignal(string key, string type, string payload) => client.OnLocalSignalAsync(key, type, payload);
+        [JSInvokable] public Task OnPeerState(string key, string state) => client.OnPeerStateAsync(key, state);
+        [JSInvokable] public Task OnRemoteTrack(string key, string kind) => client.OnRemoteTrackAsync(key, kind);
+        [JSInvokable] public Task OnData(string key, string json) => client.OnDataAsync(key, json);
+    }
+}
