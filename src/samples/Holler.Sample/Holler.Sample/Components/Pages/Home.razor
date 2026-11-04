@@ -1,0 +1,64 @@
+@page "/"
+@using System.ComponentModel.DataAnnotations
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Authentication
+@using Microsoft.AspNetCore.Authentication.Cookies
+@inject NavigationManager Navigation
+
+<PageTitle>Holler sample</PageTitle>
+
+<h1>Holler</h1>
+<p>Peer-to-peer WebRTC video for Blazor. Media goes browser-to-browser; SignalR only carries signaling.</p>
+
+@if (HttpContext?.User.Identity?.IsAuthenticated == true)
+{
+    <p>Signed in as <strong>@HttpContext.User.Identity.Name</strong>.</p>
+    <p>Open a second browser (or a private window), sign in with another name, and call each other.
+       Calls work across render modes, so you can call a Server tab from a WebAssembly tab.</p>
+
+    <table class="table w-auto">
+        <thead><tr><th></th><th>Interactive Server</th><th>WebAssembly</th><th>Auto</th></tr></thead>
+        <tbody>
+            <tr><th>1:1 call + chat</th><td><a href="call/server">call/server</a></td><td><a href="call/wasm">call/wasm</a></td><td><a href="call/auto">call/auto</a></td></tr>
+            <tr><th>Room + chat</th><td><a href="room/server">room/server</a></td><td><a href="room/wasm">room/wasm</a></td><td><a href="room/auto">room/auto</a></td></tr>
+        </tbody>
+    </table>
+
+    <form method="post" action="logout">
+        <AntiforgeryToken />
+        <button class="btn btn-outline-secondary btn-sm" type="submit">Sign out</button>
+    </form>
+}
+else
+{
+    <EditForm Model="Input" FormName="login" OnValidSubmit="SignInAsync" class="d-flex gap-2" style="max-width: 24rem">
+        <DataAnnotationsValidator />
+        <InputText @bind-Value="Input!.Name" class="form-control" placeholder="Pick a name" aria-label="Name" />
+        <button class="btn btn-primary" type="submit">Sign in</button>
+        <ValidationMessage For="() => Input!.Name" />
+    </EditForm>
+}
+
+@code {
+    [CascadingParameter] private HttpContext? HttpContext { get; set; }
+
+    [SupplyParameterFromForm] private LoginModel? Input { get; set; }
+
+    protected override void OnInitialized() => Input ??= new();
+
+    private async Task SignInAsync()
+    {
+        var name = Input!.Name!.Trim();
+        var identity = new ClaimsIdentity(
+            [new Claim(ClaimTypes.NameIdentifier, name), new Claim(ClaimTypes.Name, name)],
+            CookieAuthenticationDefaults.AuthenticationScheme);
+        await HttpContext!.SignInAsync(new ClaimsPrincipal(identity));
+        Navigation.NavigateTo("", forceLoad: true);
+    }
+
+    private sealed class LoginModel
+    {
+        [Required, StringLength(32, MinimumLength = 1), RegularExpression(@"^[\w\- ]+$", ErrorMessage = "Letters, digits, spaces, - and _ only.")]
+        public string? Name { get; set; }
+    }
+}

@@ -1,0 +1,44 @@
+@page "/call/{Mode}"
+@page "/room/{Mode}"
+@using Holler.Sample.Client.Demos
+@inject NavigationManager Navigation
+
+<PageTitle>Holler @(IsRoom ? "room" : "call") (@Mode)</PageTitle>
+
+@if (HttpContext?.User.Identity?.IsAuthenticated != true)
+{
+    <p>Please <a href="">sign in</a> first.</p>
+}
+else if (RenderMode is null)
+{
+    <p>Unknown mode <code>@Mode</code>. Use server, wasm or auto.</p>
+}
+else
+{
+    <p class="text-muted">Render mode: <strong>@Mode</strong> · signed in as <strong>@HttpContext.User.Identity.Name</strong> · <a href="">home</a></p>
+    @if (IsRoom)
+    {
+        <RoomDemo @rendermode="RenderMode" />
+    }
+    else
+    {
+        <CallDemo @rendermode="RenderMode" />
+    }
+}
+
+@code {
+    [CascadingParameter] private HttpContext? HttpContext { get; set; }
+
+    [Parameter] public string Mode { get; set; } = "";
+
+    private bool IsRoom => Navigation.ToBaseRelativePath(Navigation.Uri).StartsWith("room/", StringComparison.OrdinalIgnoreCase);
+
+    // Prerendering is off: a call UI has nothing useful to show before it is interactive.
+    private IComponentRenderMode? RenderMode => Mode.ToLowerInvariant() switch
+    {
+        "server" => new InteractiveServerRenderMode(prerender: false),
+        "wasm" => new InteractiveWebAssemblyRenderMode(prerender: false),
+        "auto" => new InteractiveAutoRenderMode(prerender: false),
+        _ => null,
+    };
+}

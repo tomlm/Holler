@@ -1,0 +1,32 @@
+@inherits HollerComponentBase
+
+@*
+    Drop this once in your layout (inside an interactive render mode). It keeps the client connected
+    so this tab can be rung, and shows an accept/decline prompt for incoming calls.
+*@
+@if (Holler.IsStarted && Holler.RingingCall is { } call)
+{
+    <div class="holler-incoming @Class" role="alertdialog" aria-label="Incoming call">
+        <span>@call.RemoteUserId is calling…</span>
+        <button type="button" class="holler-btn holler-accept" @onclick="() => Run(() => AcceptAsync(call))">Accept</button>
+        <button type="button" class="holler-btn holler-danger" @onclick="() => Run(() => Holler.DeclineAsync(call))">Decline</button>
+    </div>
+}
+
+@code {
+    /// <summary>
+    /// Called after the user accepts. Typically navigates to, or shows, a <c>HollerVideoCall</c> for <c>call.RemoteUserId</c>.
+    /// </summary>
+    [Parameter] public EventCallback<HollerCall> OnAccepted { get; set; }
+
+    [Parameter] public bool Audio { get; set; } = true;
+    [Parameter] public bool Video { get; set; } = true;
+    [Parameter] public string? Class { get; set; }
+
+    private async Task AcceptAsync(HollerCall call)
+    {
+        await Holler.StartMediaAsync(Audio, Video);
+        await Holler.AcceptAsync(call);
+        await OnAccepted.InvokeAsync(call);
+    }
+}
