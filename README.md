@@ -6,8 +6,6 @@
 
 ![Screenshot](https://raw.githubusercontent.com/tomlm/Holler/refs/heads/main/screenshot.gif)
 
-# Holler
-
 Dead-simple peer-to-peer WebRTC video for Blazor.
 
 - **Media is peer-to-peer.** Audio, video and chat go browser-to-browser over `RTCPeerConnection` and data channels.
