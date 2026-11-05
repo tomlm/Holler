@@ -156,6 +156,7 @@ public sealed class HollerClient : IAsyncDisposable
         var result = await Exclusive(async () =>
             await _engine!.InvokeAsync<HollerMediaResult>("startMedia", audio, video, videoSettings ?? new HollerVideoSettings()));
         LocalMedia = result;
+        LogMediaResult("started", result);
         if (result.Ok)
         {
             await RefreshDeviceIdsAsync();
@@ -177,6 +178,7 @@ public sealed class HollerClient : IAsyncDisposable
         var result = await Exclusive(async () =>
             await _engine.InvokeAsync<HollerMediaResult>("retryMedia", requested.Audio, requested.Video));
         LocalMedia = result;
+        LogMediaResult("retried", result);
         if (result.Ok)
         {
             await RefreshDeviceIdsAsync();
@@ -185,6 +187,43 @@ public sealed class HollerClient : IAsyncDisposable
         }
         NotifyChanged();
         return result;
+    }
+
+    /// <summary>
+    /// Why something <see cref="StartMediaAsync"/> asked for isn't running, in words for the user (e.g. the camera is
+    /// blocked, in use by another app, or missing), or null when everything requested is running.
+    /// </summary>
+    public string? MediaIssue
+    {
+        get
+        {
+            if (!MissingRequestedMedia || LocalMedia is not { } media)
+                return null;
+            var requested = _requestedMedia!.Value;
+            var what = requested.Video && !media.Video && requested.Audio && !media.Audio ? "Camera and microphone"
+                : requested.Video && !media.Video ? "Camera"
+                : "Microphone";
+            var name = media.Error?.Split(':')[0].Trim();
+            return name switch
+            {
+                _ when media.PermissionDenied =>
+                    $"{what} blocked. Click the camera icon in the address bar, choose Allow, then try again.",
+                "NotReadableError" or "TrackStartError" or "AbortError" =>
+                    $"{what} couldn't start: it may be in use by another app or tab. Close it, then try again.",
+                "NotFoundError" or "DevicesNotFoundError" or "OverconstrainedError" =>
+                    $"No {what.ToLowerInvariant()} found.",
+                _ => $"{what} unavailable{(media.Error is null ? "" : $" ({media.Error})")}.",
+            };
+        }
+    }
+
+    private void LogMediaResult(string action, HollerMediaResult result)
+    {
+        if (MissingRequestedMedia)
+            _logger.LogWarning("Holler {UserId}: media {Action} without everything requested: audio={Audio} video={Video} error={Error} denied={Denied}",
+                UserId, action, result.Audio, result.Video, result.Error, result.PermissionDenied);
+        else
+            _logger.LogInformation("Holler {UserId}: media {Action}: audio={Audio} video={Video}", UserId, action, result.Audio, result.Video);
     }
 
     private bool MissingRequestedMedia =>
@@ -693,6 +732,9 @@ public sealed class HollerClient : IAsyncDisposable
                 peer.DataChannelOpen = true;
             else
                 peer.ConnectionState = state;
+            if (state is "connected" or "disconnected" or "failed")
+                _logger.Log(state == "connected" ? LogLevel.Information : LogLevel.Warning,
+                    "Holler {UserId}: connection to {PeerUserId} ({Context}) {State}", UserId, peer.UserId, peer.Room ?? "call", state);
             if (peer.CallId is not null)
                 call = _calls.GetValueOrDefault(peer.CallId);
             if (call is not null && state == "connected")
@@ -708,6 +750,31 @@ public sealed class HollerClient : IAsyncDisposable
         NotifyChanged();
     });
 
+    private Task OnPeerRouteAsync(string key, string local, string remote, string protocol) => Post(() =>
+    {
+        HollerPeer? peer;
+        lock (_sync)
+        {
+            peer = _peers.GetValueOrDefault(key);
+            if (peer is not null)
+                peer.Route = local == "relay" || remote == "relay" ? $"relay ({protocol})" : "direct";
+        }
+        if (peer is not null)
+        {
+            _logger.LogInformation("Holler {UserId}: connected to {PeerUserId} via {Route} (local {Local}, remote {Remote})",
+                UserId, peer.UserId, peer.Route, local, remote);
+            NotifyChanged();
+        }
+        return Task.CompletedTask;
+    });
+
+    // Diagnostics from the browser engine.
+    private Task OnLogAsync(string level, string message)
+    {
+        _logger.Log(level == "warn" ? LogLevel.Warning : LogLevel.Information, "Holler {UserId}: {Message}", UserId, message);
+        return Task.CompletedTask;
+    }
+
     private Task OnRemoteTrackAsync(string key, string kind) => Post(() =>
     {
         lock (_sync)
@@ -716,6 +783,7 @@ public sealed class HollerClient : IAsyncDisposable
             {
                 if (kind == "video") peer.HasVideo = true;
                 else peer.HasAudio = true;
+                _logger.LogInformation("Holler {UserId}: receiving {Kind} from {PeerUserId}", UserId, kind, peer.UserId);
             }
         }
         NotifyChanged();
@@ -890,5 +958,7 @@ public sealed class HollerClient : IAsyncDisposable
         [JSInvokable] public Task OnRemoteTrack(string key, string kind) => client.OnRemoteTrackAsync(key, kind);
         [JSInvokable] public Task OnData(string key, string json) => client.OnDataAsync(key, json);
         [JSInvokable] public Task OnMediaPermissionChanged(string name, string state) => client.OnMediaPermissionChangedAsync(name, state);
+        [JSInvokable] public Task OnPeerRoute(string key, string local, string remote, string protocol) => client.OnPeerRouteAsync(key, local, remote, protocol);
+        [JSInvokable] public Task OnLog(string level, string message) => client.OnLogAsync(level, message);
     }
 }

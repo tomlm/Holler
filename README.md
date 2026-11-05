@@ -79,6 +79,7 @@ components do it for you).
 | `GetCamerasAsync()`, `GetMicrophonesAsync()` | Devices for a picker, with fallback names ("Camera 1") where the browser gives none. Call after media has started: browsers hide device names until permission is granted. |
 | `SelectCameraAsync(id)`, `SelectMicrophoneAsync(id)`, `CameraDeviceId`, `MicrophoneDeviceId` | Switch devices mid-call. The new track replaces the old one on every connection, so nothing reconnects. The browser remembers the choice for next time (falling back to the default if that device is gone). |
 | `RetryMediaAsync()` | Asks again for whatever `StartMediaAsync` requested but didn't get, adding it to calls already in progress. |
+| `MediaIssue` | Why something requested isn't running, in words for the user: blocked, in use by another app, or missing (or null). `HollerMediaControls` shows it with **Try again**. If the camera fails, Holler carries on with audio only, so show this. |
 
 ### Video size follows what viewers actually draw
 
@@ -111,10 +112,17 @@ Camera access needs a secure origin: HTTPS, or `http://localhost` during develop
 machine, use HTTPS on your LAN address or a tunnel. With Visual Studio dev tunnels, run the **http** launch
 profile: tunnels to the HTTPS endpoint don't carry Blazor's WebSocket.
 
+### Diagnostics
+
+`HollerClient` logs to `ILogger` (category `Holler.HollerClient`), so with Blazor Server every player's events land in
+your server log: their browser, the media start result (and why a camera failed), connection states, what arrives from
+whom, and each connection's route, direct or relayed through TURN. `HollerPeer.Route` (`"direct"`, `"relay (udp)"`, ...)
+and `IsRelayed` expose the route to your UI. WebAssembly clients log to the browser console instead.
+
 ### Picture-in-picture and autoplay
 
 Holler's videos opt out of the browser's picture-in-picture button. If the browser blocks audio until the user
-interacts with the page (common when joining on page load), Holler starts playback on the first click or key press.
+interacts with the page (common when joining on page load), Holler starts playback on the first click, tap or key press.
 
 ## Configuration
 
