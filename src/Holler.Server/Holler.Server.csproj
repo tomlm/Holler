@@ -5,6 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Holler.Server</PackageId>
+    <Version>0.1.0</Version>
     <Description>Server side of Holler: the SignalR signaling hub and Blazor Server support for peer-to-peer WebRTC in Blazor.</Description>
     <Authors>Tom Laird-McConnell</Authors>
     <PackageTags>blazor;webrtc;signalr;video;p2p</PackageTags>
