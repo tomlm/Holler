@@ -1,5 +1,6 @@
 using Holler.Server;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Components.Server.Circuits;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -24,6 +25,7 @@ public static class HollerServerExtensions
         services.TryAddSingleton<IHollerUserIdProvider, ClaimsHollerUserIdProvider>();
         services.TryAddSingleton<IIceServerProvider, OptionsIceServerProvider>();
         services.TryAddScoped<Holler.ISignalingChannel, InProcessSignalingChannel>();
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<CircuitHandler, HollerCircuitHandler>());
         services.TryAddScoped<Holler.HollerClient>();
         return services;
     }

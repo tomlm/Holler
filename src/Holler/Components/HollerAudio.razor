@@ -1,0 +1,28 @@
+@implements IAsyncDisposable
+@inject HollerClient Holler
+
+@* Plays a peer's audio with no visible element, independent of whether their video is on screen. *@
+<audio @ref="_audio" autoplay hidden></audio>
+
+@code {
+    [Parameter, EditorRequired] public HollerPeer Peer { get; set; } = default!;
+
+    private ElementReference _audio;
+    private string? _attached;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (Peer.Key == _attached)
+            return;
+        if (_attached is not null)
+            await Holler.DetachAsync(_audio, _attached);
+        _attached = Peer.Key;
+        await Holler.AttachAsync(_audio, _attached, muted: false);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_attached is not null)
+            await Holler.DetachAsync(_audio, _attached);
+    }
+}

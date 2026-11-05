@@ -6,6 +6,10 @@
         {
             <div class="holler-tile holler-tile-local">
                 <HollerVideo Local="true" />
+                @if (!Holler.CameraEnabled)
+                {
+                    <div class="holler-placeholder">@Holler.UserId</div>
+                }
                 <span class="holler-tile-name">@(Holler.UserId) (you)</span>
             </div>
         }
@@ -15,15 +19,19 @@
             {
                 <div class="holler-tile" @key="peer.Key">
                     <HollerVideo Peer="peer" />
+                    @if (!peer.IsVideoVisible)
+                    {
+                        <div class="holler-placeholder">@peer.UserId</div>
+                    }
                     <span class="holler-tile-name">@peer.UserId@(peer.ConnectionState == "connected" ? "" : $" · {peer.ConnectionState}")</span>
                 </div>
             }
         }
     </div>
 
-    @if (Error is not null || Holler.LocalMedia is { Ok: false })
+    @if (Error is not null)
     {
-        <div class="holler-error">@(Error ?? Holler.LocalMedia?.Error)</div>
+        <div class="holler-error">@Error</div>
     }
 
     @if (ShowControls)
@@ -31,7 +39,7 @@
         <div class="holler-controls">
             @if (_room is not null)
             {
-                <HollerMediaToggles />
+                <HollerMediaControls />
                 <button type="button" class="holler-btn holler-danger" @onclick="() => Run(LeaveAsync)">Leave</button>
             }
             else

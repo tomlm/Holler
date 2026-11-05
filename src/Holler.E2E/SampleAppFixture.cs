@@ -15,6 +15,12 @@ public sealed class SampleAppFixture
     public static string BaseUrl { get; private set; } = "";
     public static IBrowser Browser { get; private set; } = null!;
 
+    /// <summary>
+    /// Fake devices without the auto-accepting fake UI, so camera/mic permission really applies (tests set it with
+    /// the DevTools protocol to imitate a user's Block and Allow).
+    /// </summary>
+    public static IBrowser BrowserWithRealPermissions { get; private set; } = null!;
+
     /// <summary>Short enough to test "no answer", long enough for the other tests to answer.</summary>
     public static TimeSpan RingTimeout { get; } = TimeSpan.FromSeconds(8);
 
@@ -43,6 +49,12 @@ public sealed class SampleAppFixture
                     "--use-fake-device-for-media-stream",
                     "--autoplay-policy=no-user-gesture-required",
                 ],
+            });
+            BrowserWithRealPermissions = await _playwright.Chromium.LaunchAsync(new()
+            {
+                // Full Chromium (new headless), not the headless shell: only it applies camera/mic permissions.
+                Channel = "chromium",
+                Args = ["--use-fake-device-for-media-stream", "--autoplay-policy=no-user-gesture-required"],
             });
         }
         catch (PlaywrightException ex) when (ex.Message.Contains("Executable doesn't exist"))
@@ -93,6 +105,8 @@ public sealed class SampleAppFixture
     {
         if (Browser is not null)
             await Browser.CloseAsync();
+        if (BrowserWithRealPermissions is not null)
+            await BrowserWithRealPermissions.CloseAsync();
         _playwright?.Dispose();
         if (_app is { HasExited: false })
         {

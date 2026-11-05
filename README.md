@@ -50,13 +50,65 @@ custom properties or the `.holler-*` classes.
 | `HollerIncomingCall` | Accept/decline prompt for incoming calls. Put it in an interactive layout or page; it also keeps the tab connected so it can be rung. |
 | `HollerVideoRoom` | Joins room `Name` (`AutoJoin`) and shows every member in a grid. |
 | `HollerChat` | Data-channel chat for a call (`UserId`) or a room (`Room`). |
-| `HollerVideo` | A single `<video>` for a `HollerPeer`, or your camera with `Local`. Use it to build your own layout. |
-| `HollerMediaToggles` | Mute and camera buttons. |
+| `HollerVideo` | A single `<video>` for a `HollerPeer`, or your camera with `Local`. Use it to build your own layout. `Muted` silences it (see `HollerAudio`). |
+| `HollerAudio` | Plays a peer's audio from a hidden element, so it keeps playing while their video isn't on screen. |
+| `HollerMediaControls` | Mute and camera buttons, each with a device picker, plus guidance and **Try again** when the browser has blocked the camera or microphone. |
 
-To build your own UI, inject `HollerClient` (or inherit `HollerComponentBase`). It provides `CallAsync`,
-`AcceptAsync`, `DeclineAsync`, `HangupAsync`, `JoinRoomAsync`, `LeaveRoomAsync`, `SendMessageAsync`,
-`SetMicrophoneAsync`, `SetCameraAsync`, `OnlineUsers`, `Calls` and `Rooms`, plus the `Changed`, `IncomingCall` and
-`MessageReceived` events.
+To build your own UI, inject `HollerClient` (or inherit `HollerComponentBase`, which starts the client after the
+first interactive render and re-renders on every change). It provides `CallAsync`, `AcceptAsync`, `DeclineAsync`,
+`HangupAsync`, `JoinRoomAsync`, `LeaveRoomAsync`, `SendMessageAsync`, `OnlineUsers`, `Calls` and `Rooms`, the camera
+and microphone API below, and the `Changed`, `IncomingCall` and `MessageReceived` events.
+
+## Camera and microphone
+
+Media is opt-in: nothing touches the camera or microphone until you call `StartMediaAsync` (the call and room
+components do it for you).
+
+| Member | Purpose |
+|---|---|
+| `StartMediaAsync(audio, video, videoSettings)` | Asks for the camera and/or microphone. Falls back to audio only if there's no camera or it's blocked. Returns a `HollerMediaResult` (`Ok`, `Audio`, `Video`, `Error`, `PermissionDenied`), also kept in `LocalMedia`. |
+| `StopMediaAsync()` | Releases both, so the browser's recording indicator goes off (e.g. when leaving the page that uses them). |
+| `IsMicrophoneOn`, `IsCameraOn` | What a mute / show-video button should show: the device is running *and* not muted/hidden. |
+| `ToggleMicrophoneAsync()`, `ToggleCameraAsync()` (or `SetMicrophoneAsync(bool)`, `SetCameraAsync(bool)`) | Mute and hide video. Peers are told, so they can show a placeholder instead of a black frame (`HollerPeer.VideoEnabled` / `AudioEnabled`, `IsVideoVisible`); once they stop drawing your video, you stop sending it to them. |
+| `GetCamerasAsync()`, `GetMicrophonesAsync()` | Devices for a picker, with fallback names ("Camera 1") where the browser gives none. Call after media has started: browsers hide device names until permission is granted. |
+| `SelectCameraAsync(id)`, `SelectMicrophoneAsync(id)`, `CameraDeviceId`, `MicrophoneDeviceId` | Switch devices mid-call. The new track replaces the old one on every connection, so nothing reconnects. The browser remembers the choice for next time (falling back to the default if that device is gone). |
+| `RetryMediaAsync()` | Asks again for whatever `StartMediaAsync` requested but didn't get, adding it to calls already in progress. |
+
+### Video size follows what viewers actually draw
+
+`HollerVideoSettings(MaxWidth, MaxHeight, MaxFrameRate, MaxBitrateKbps)` are **ceilings**, not what everyone
+receives. Each viewer measures how big it draws your video (in device pixels) and tells you over the data channel;
+you then send that viewer a copy scaled down to that size, with the bitrate scaled to match, and **nothing at all**
+while it isn't showing your video. A 56 px avatar costs a viewer roughly 100 kbps instead of the camera's full
+resolution, and hiding a drawer stops that video entirely.
+
+```csharp
+await holler.StartMediaAsync(videoSettings: new(MaxWidth: 640, MaxHeight: 480, MaxFrameRate: 24, MaxBitrateKbps: 800));
+```
+
+The encoder keeps resolution and drops frames when bandwidth is short, so small thumbnails are sharp within a
+couple of seconds instead of starting blurry.
+
+### When the user blocks the camera or microphone
+
+Browsers don't ask twice: after the user clicks **Block** (Chrome/Edge), every request fails immediately until
+they allow it again from the camera icon in the address bar. (A dismissed prompt, or Firefox without "Remember
+this decision", does ask again.) Holler makes recovery painless:
+
+- `LocalMedia.PermissionDenied` is set, so you can explain what to do. `HollerMediaControls` shows the
+  instructions and a **Try again** button.
+- Holler watches the browser's permission state and restarts media **by itself** as soon as the user switches it
+  to Allow, with no reload.
+- `RetryMediaAsync()` retries on demand (e.g. from your own button).
+
+Camera access needs a secure origin: HTTPS, or `http://localhost` during development. To test from a second
+machine, use HTTPS on your LAN address or a tunnel. With Visual Studio dev tunnels, run the **http** launch
+profile: tunnels to the HTTPS endpoint don't carry Blazor's WebSocket.
+
+### Picture-in-picture and autoplay
+
+Holler's videos opt out of the browser's picture-in-picture button. If the browser blocks audio until the user
+interacts with the page (common when joining on page load), Holler starts playback on the first click or key press.
 
 ## Configuration
 

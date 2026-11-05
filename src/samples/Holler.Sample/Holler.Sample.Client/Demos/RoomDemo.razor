@@ -17,6 +17,14 @@
 }
 
 @code {
+    [Parameter] public string? InitialRoom { get; set; }
+
     private string _room = "lobby";
     private string _draft = "lobby";
+
+    protected override void OnInitialized()
+    {
+        if (!string.IsNullOrWhiteSpace(InitialRoom))
+            _room = _draft = InitialRoom;
+    }
 }

@@ -11,6 +11,13 @@ public class SampleTests
 
     private static string Url(string path) => SampleAppFixture.BaseUrl + path;
 
+    /// <summary>A room page for a room no other test uses.</summary>
+    private static string RoomUrl(string mode, string room) => Url($"room/{mode}?room={Uri.EscapeDataString(room)}");
+
+    private static string NewRoom() => "room-" + Guid.NewGuid().ToString("N")[..8];
+
+    private const string RemoteVideos = "[...document.querySelectorAll('.holler-tile:not(.holler-tile-local) video')]";
+
     [SetUp]
     public void SetUp() => SampleAppFixture.RequireBrowser();
 
@@ -23,10 +30,12 @@ public class SampleTests
     }
 
     /// <summary>A fresh browser context signed in as <paramref name="name"/> (unique per test run).</summary>
-    private async Task<(string Name, IPage Page)> SignInAsync(string name)
+    private async Task<(string Name, IPage Page)> SignInAsync(string name, bool realPermissions = false)
     {
         name = $"{name}-{Guid.NewGuid().ToString("N")[..6]}";
-        var context = await SampleAppFixture.Browser.NewContextAsync(new() { Permissions = ["camera", "microphone"] });
+        var context = realPermissions
+            ? await SampleAppFixture.BrowserWithRealPermissions.NewContextAsync()
+            : await SampleAppFixture.Browser.NewContextAsync(new() { Permissions = ["camera", "microphone"] });
         _contexts.Add(context);
         var page = await context.NewPageAsync();
         await page.GotoAsync(Url(""));
@@ -144,13 +153,128 @@ public class SampleTests
     }
 
     [Test]
+    public async Task Hiding_camera_shows_a_placeholder_to_peers()
+    {
+        var a = await SignInAsync("jo");
+        var b = await SignInAsync("kim");
+        var room = NewRoom();
+        await a.Page.GotoAsync(RoomUrl("server", room));
+        await b.Page.GotoAsync(RoomUrl("wasm", room));
+        var placeholderForA = b.Page.Locator(".holler-tile:not(.holler-tile-local) .holler-placeholder", new() { HasText = a.Name });
+        await b.Page.WaitForFunctionAsync(
+            "() => [...document.querySelectorAll('.holler-tile:not(.holler-tile-local) video')].some(v => v.videoWidth > 0)",
+            null, new() { Timeout = 30_000 });
+        Assert.That(await placeholderForA.CountAsync(), Is.Zero);
+
+        await a.Page.GetByRole(AriaRole.Button, new() { Name = "Camera off", Exact = true }).ClickAsync();
+        await placeholderForA.WaitForAsync(new() { Timeout = 10_000 });
+        await a.Page.Locator(".holler-tile-local .holler-placeholder").WaitForAsync(new() { Timeout = 5_000 });
+
+        await a.Page.GetByRole(AriaRole.Button, new() { Name = "Camera on", Exact = true }).ClickAsync();
+        await placeholderForA.WaitForAsync(new() { State = WaitForSelectorState.Detached, Timeout = 10_000 });
+    }
+
+    [TestCase("server")]
+    [TestCase("wasm")]
+    public async Task Closing_the_tab_removes_the_peer_promptly(string leaverMode)
+    {
+        var a = await SignInAsync("lee");
+        var b = await SignInAsync("max");
+        var room = NewRoom();
+        await a.Page.GotoAsync(RoomUrl(leaverMode, room));
+        await b.Page.GotoAsync(RoomUrl("server", room));
+        await b.Page.WaitForFunctionAsync($"() => {RemoteVideos}.some(v => v.videoWidth > 0)", null, new() { Timeout = 30_000 });
+
+        // A Blazor Server circuit outlives its closed tab by minutes; the peer must still go right away.
+        await a.Page.Context.CloseAsync();
+        _contexts.Remove(a.Page.Context);
+
+        await b.Page.WaitForFunctionAsync($"() => {RemoteVideos}.length === 0", null, new() { Timeout = 15_000 });
+    }
+
+    [Test]
+    public async Task Video_resolution_follows_the_size_the_viewer_draws_it()
+    {
+        var a = await SignInAsync("ned");
+        var b = await SignInAsync("oli");
+        await b.Page.SetViewportSizeAsync(560, 800);
+        var room = NewRoom();
+        await a.Page.GotoAsync(RoomUrl("server", room));
+        await b.Page.GotoAsync(RoomUrl("server", room));
+
+        // Small tiles: the sender scales its 1280x720 capture down to roughly what the tile shows.
+        await b.Page.WaitForFunctionAsync($"() => {RemoteVideos}.some(v => v.videoWidth > 0 && v.videoWidth <= 420)",
+            null, new() { Timeout = 15_000 });
+
+        // Bigger tiles: the viewer reports the new size and gets more pixels.
+        await b.Page.SetViewportSizeAsync(1600, 900);
+        await b.Page.WaitForFunctionAsync($"() => {RemoteVideos}.some(v => v.videoWidth >= 560)",
+            null, new() { Timeout = 15_000 });
+    }
+
+    [Test]
+    public async Task Device_pickers_list_devices_and_switching_keeps_video()
+    {
+        var a = await SignInAsync("pia");
+        await a.Page.GotoAsync(RoomUrl("server", NewRoom()));
+        var camera = a.Page.GetByLabel("Camera", new() { Exact = true });
+        var microphone = a.Page.GetByLabel("Microphone", new() { Exact = true });
+        await camera.Locator("option").First.WaitForAsync(new() { State = WaitForSelectorState.Attached, Timeout = 20_000 });
+        Assert.That(await microphone.Locator("option").CountAsync(), Is.GreaterThan(0));
+
+        // Switch to the last listed camera (the fake device offers one; the switch still goes through getUserMedia).
+        var last = await camera.Locator("option").Last.GetAttributeAsync("value");
+        await camera.SelectOptionAsync(last!);
+        await a.Page.WaitForFunctionAsync(
+            "() => [...document.querySelectorAll('.holler-tile-local video')].some(v => v.videoWidth > 0 && !v.paused)",
+            null, new() { Timeout = 10_000 });
+        Assert.That(await camera.InputValueAsync(), Is.EqualTo(last));
+        Assert.That(await a.Page.Locator(".holler-error").CountAsync(), Is.Zero);
+    }
+
+    [Test]
+    public async Task Blocked_camera_explains_and_recovers_once_allowed()
+    {
+        var a = await SignInAsync("quin", realPermissions: true);
+        await SetMediaPermissionAsync(a.Page, "denied");   // what the user's "Block" leaves behind
+        await a.Page.GotoAsync(RoomUrl("server", NewRoom()));
+        await a.Page.GetByText("Camera or microphone is blocked").WaitForAsync(new() { Timeout = 20_000 });
+
+        // The user switches the site to Allow in the address bar; Holler notices and starts the camera itself.
+        await SetMediaPermissionAsync(a.Page, "granted");
+        await a.Page.WaitForFunctionAsync(
+            "() => [...document.querySelectorAll('.holler-tile-local video')].some(v => v.videoWidth > 0)",
+            null, new() { Timeout = 15_000 });
+        await a.Page.GetByText("Camera or microphone is blocked").WaitForAsync(new() { State = WaitForSelectorState.Detached, Timeout = 5_000 });
+    }
+
+    /// <summary>Sets camera and microphone permission for the sample's origin in this page's browser context.</summary>
+    private static async Task SetMediaPermissionAsync(IPage page, string setting)
+    {
+        var cdp = await page.Context.NewCDPSessionAsync(page);
+        var target = await cdp.SendAsync("Target.getTargetInfo");
+        var contextId = target!.Value.GetProperty("targetInfo").GetProperty("browserContextId").GetString()!;
+        foreach (var name in new[] { "camera", "microphone" })
+        {
+            await cdp.SendAsync("Browser.setPermission", new Dictionary<string, object>
+            {
+                ["permission"] = new Dictionary<string, object> { ["name"] = name },
+                ["setting"] = setting,
+                ["origin"] = SampleAppFixture.BaseUrl.TrimEnd('/'),
+                ["browserContextId"] = contextId,
+            });
+        }
+    }
+
+    [Test]
     public async Task Room_meshes_every_render_mode_with_chat_and_leave()
     {
         var users = new List<IPage>();
+        var room = NewRoom();
         foreach (var mode in new[] { "server", "wasm", "auto" })
         {
             var u = await SignInAsync($"room-{mode}");
-            await u.Page.GotoAsync(Url($"room/{mode}"));
+            await u.Page.GotoAsync(RoomUrl(mode, room));
             users.Add(u.Page);
         }
 

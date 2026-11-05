@@ -11,6 +11,23 @@ class Engine {
         this.peers = new Map();   // key -> peer
         this.streams = new Map(); // key -> MediaStream
         this.views = new Map();   // key -> Set<HTMLMediaElement>
+        // Upper bounds for our outgoing video; each viewer is sent only what it renders (see _applyEncoding).
+        this.videoSettings = { maxWidth: 1280, maxHeight: 720, maxFrameRate: 30, maxBitrateKbps: 1500 };
+
+        // Watch how big each peer's video is drawn here, and tell that peer (see _reportViews).
+        this.resizeObserver = new ResizeObserver(() => this._scheduleViewReport());
+        this.onDevicePixelRatioChange = () => this._scheduleViewReport();
+        window.addEventListener('resize', this.onDevicePixelRatioChange);
+
+        // Browsers may block audible autoplay until the user interacts with the page (e.g. when a room is
+        // joined on page load). Retry any paused media on the next click or key press.
+        this.resumePlayback = () => {
+            for (const set of this.views.values())
+                for (const element of set)
+                    if (element.srcObject && element.paused) element.play?.().catch(() => { });
+        };
+        for (const type of ['pointerdown', 'keydown'])
+            document.addEventListener(type, this.resumePlayback, { capture: true, passive: true });
     }
 
     // Applies to peer connections created afterwards (e.g. refreshed TURN credentials).
@@ -23,28 +40,156 @@ class Engine {
         });
     }
 
-    async startMedia(audio, video) {
+    async startMedia(audio, video, videoSettings) {
+        if (videoSettings) this.videoSettings = { ...this.videoSettings, ...videoSettings };
+        let failure = null;
         if (!this.localStream) {
             try {
-                this.localStream = await navigator.mediaDevices.getUserMedia({ audio, video });
+                this.localStream = await navigator.mediaDevices.getUserMedia({
+                    audio: audio && this._preferred('audio'),
+                    video: video && { ...this._preferredObject('video'), ...this._videoConstraints() },
+                });
             } catch (e) {
-                if (!(audio && video)) return { ok: false, audio: false, video: false, error: `${e.name}: ${e.message}` };
+                failure = e;
+                if (!(audio && video)) return this._mediaResult(failure);
                 // Fall back to audio only (no camera, or camera denied).
                 try {
-                    this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-                } catch (e2) {
-                    return { ok: false, audio: false, video: false, error: `${e.name}: ${e.message}` };
+                    this.localStream = await navigator.mediaDevices.getUserMedia({ audio: this._preferred('audio'), video: false });
+                } catch {
+                    return this._mediaResult(failure);
                 }
             }
             this._setStream(LOCAL, this.localStream);
             for (const peer of this.peers.values()) this._addLocalTracks(peer);
         }
+        return this._mediaResult(failure);
+    }
+
+    // Adds whichever requested kinds are missing (e.g. the camera after the user unblocks it), without
+    // disturbing what is already running. New tracks reach existing peers through renegotiation.
+    async retryMedia(audio, video) {
+        if (!this.localStream) return this.startMedia(audio, video);
+        const missing = [];
+        if (audio && this.localStream.getAudioTracks().length === 0) missing.push('audio');
+        if (video && this.localStream.getVideoTracks().length === 0) missing.push('video');
+        let failure = null, added = 0;
+        for (const kind of missing) {
+            try {
+                const constraints = kind === 'video'
+                    ? { ...this._preferredObject('video'), ...this._videoConstraints() }
+                    : this._preferred('audio');
+                const stream = await navigator.mediaDevices.getUserMedia({ [kind]: constraints });
+                this.localStream = new MediaStream([...this.localStream.getTracks(), ...stream.getTracks()]);
+                added++;
+            } catch (e) {
+                failure = e;
+            }
+        }
+        if (added > 0) {
+            this._setStream(LOCAL, this.localStream);
+            for (const peer of this.peers.values()) this._addLocalTracks(peer);
+        }
+        return this._mediaResult(failure);
+    }
+
+    _mediaResult(failure) {
+        const audio = this.localStream?.getAudioTracks().length > 0;
+        const video = this.localStream?.getVideoTracks().length > 0;
+        const permissionDenied = failure?.name === 'NotAllowedError' || failure?.name === 'SecurityError';
+        if (permissionDenied) this._watchPermissions();
         return {
-            ok: true,
-            audio: this.localStream.getAudioTracks().length > 0,
-            video: this.localStream.getVideoTracks().length > 0,
-            error: null
+            ok: !!this.localStream,
+            audio, video,
+            error: failure ? `${failure.name}: ${failure.message}` : null,
+            permissionDenied,
         };
+    }
+
+    // Tell .NET when the user changes camera/microphone permission (e.g. switches a block to Allow in the
+    // address bar), so it can retry without a reload. Not every browser can query these permissions.
+    _watchPermissions() {
+        if (this.watchingPermissions || !navigator.permissions?.query) return;
+        this.watchingPermissions = true;
+        for (const name of ['camera', 'microphone']) {
+            navigator.permissions.query({ name }).then(status => {
+                status.onchange = () => this._notify('OnMediaPermissionChanged', name, status.state);
+            }).catch(() => { /* unsupported permission name */ });
+        }
+    }
+
+    // Cameras and microphones. Labels are only filled in once the user has granted media permission.
+    async listDevices() {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        return devices
+            .filter(d => d.kind === 'videoinput' || d.kind === 'audioinput')
+            .map(d => ({ deviceId: d.deviceId, kind: d.kind === 'videoinput' ? 'video' : 'audio', label: d.label }));
+    }
+
+    // The deviceId of the camera/microphone currently in use, or null.
+    currentDevice(kind) {
+        const track = this._localTrack(kind);
+        return track?.getSettings().deviceId ?? null;
+    }
+
+    // Swaps the camera or microphone in place: every peer gets the new track via replaceTrack, so no
+    // renegotiation is needed and the call carries on uninterrupted.
+    async switchDevice(kind, deviceId) {
+        if (!this.localStream) return { ok: false, error: 'Media not started' };
+        const old = this._localTrack(kind);
+        let track;
+        try {
+            const constraints = { deviceId: { exact: deviceId }, ...(kind === 'video' ? this._videoConstraints() : {}) };
+            const stream = await navigator.mediaDevices.getUserMedia({ [kind]: constraints });
+            track = stream.getTracks()[0];
+        } catch (e) {
+            return { ok: false, error: `${e.name}: ${e.message}` };
+        }
+        track.enabled = old ? old.enabled : true;
+
+        for (const peer of this.peers.values()) {
+            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === kind);
+            if (sender) await sender.replaceTrack(track);
+            else this._addLocalTracks(peer);
+        }
+        if (old) {
+            this.localStream.removeTrack(old);
+            old.stop();
+        }
+        this.localStream.addTrack(track);
+        try { localStorage.setItem(`holler.device.${kind}`, deviceId); } catch { /* storage unavailable */ }
+        // A fresh stream object makes video elements pick up the new camera reliably.
+        this.localStream = new MediaStream(this.localStream.getTracks());
+        this._setStream(LOCAL, this.localStream);
+        // The new camera may capture at a different size, which changes the scaling for every viewer.
+        if (kind === 'video') for (const peer of this.peers.values()) this._applyEncoding(peer);
+        return { ok: true, error: null };
+    }
+
+    // Capture no more than the configured maximum; viewers then get scaled-down copies as they need.
+    _videoConstraints() {
+        const s = this.videoSettings;
+        return {
+            width: { ideal: s.maxWidth, max: s.maxWidth },
+            height: { ideal: s.maxHeight, max: s.maxHeight },
+            frameRate: { ideal: s.maxFrameRate, max: s.maxFrameRate },
+        };
+    }
+
+    _preferredObject(kind) {
+        const preferred = this._preferred(kind);
+        return preferred === true ? {} : preferred;
+    }
+
+    // The device picked last time, as a preference (not exact), so a missing device falls back to the default.
+    _preferred(kind) {
+        let deviceId = null;
+        try { deviceId = localStorage.getItem(`holler.device.${kind}`); } catch { /* storage unavailable */ }
+        return deviceId ? { deviceId: { ideal: deviceId } } : true;
+    }
+
+    _localTrack(kind) {
+        if (!this.localStream) return null;
+        return (kind === 'audio' ? this.localStream.getAudioTracks() : this.localStream.getVideoTracks())[0] ?? null;
     }
 
     stopMedia() {
@@ -66,15 +211,20 @@ class Engine {
         if (!set) this.views.set(key, set = new Set());
         set.add(element);
         element.muted = !!muted;
+        element.disablePictureInPicture = true;
         element.autoplay = true;
         element.playsInline = true;
         this._bind(element, this.streams.get(key) || null);
+        if (element.tagName === 'VIDEO' && key !== LOCAL) this.resizeObserver.observe(element);
+        this._scheduleViewReport();
     }
 
     detach(element, key) {
         if (!element) return;
         this.views.get(key)?.delete(element);
         element.srcObject = null;
+        this.resizeObserver.unobserve(element);
+        this._scheduleViewReport();
     }
 
     createPeer(key, polite, initiator) {
@@ -107,7 +257,11 @@ class Engine {
                 peer.makingOffer = false;
             }
         };
-        pc.onconnectionstatechange = () => this._notify('OnPeerState', key, pc.connectionState);
+        pc.onconnectionstatechange = () => {
+            // Encodings only exist once negotiated, so apply any size the viewer already asked for.
+            if (pc.connectionState === 'connected') this._applyEncoding(peer);
+            this._notify('OnPeerState', key, pc.connectionState);
+        };
 
         // The initiator sets up media and the data channel immediately, which triggers the offer.
         // The other side waits until the offer is applied so its tracks bind to the offered transceivers.
@@ -134,6 +288,8 @@ class Engine {
                 this._notify('OnLocalSignal', key, 'description', JSON.stringify(pc.localDescription));
             }
             for (const candidate of peer.pendingIce.splice(0)) await this._addIce(peer, candidate);
+            // A renegotiation may have added our video sender (e.g. camera unblocked mid-call): size it.
+            if (pc.signalingState === 'stable') this._applyEncoding(peer);
         } else if (type === 'ice') {
             const candidate = JSON.parse(payload);
             if (!pc.remoteDescription) peer.pendingIce.push(candidate);
@@ -158,8 +314,13 @@ class Engine {
     }
 
     dispose() {
+        for (const type of ['pointerdown', 'keydown'])
+            document.removeEventListener(type, this.resumePlayback, { capture: true });
         for (const key of [...this.peers.keys()]) this.closePeer(key);
         this.stopMedia();
+        this.resizeObserver.disconnect();
+        window.removeEventListener('resize', this.onDevicePixelRatioChange);
+        clearTimeout(this.viewReportTimer);
         this.views.clear();
         this.dotnet = null;
     }
@@ -168,8 +329,22 @@ class Engine {
         if (peer.ready) return;
         peer.ready = true;
         const dc = peer.pc.createDataChannel('holler', { negotiated: true, id: 0 });
-        dc.onmessage = e => this._notify('OnData', peer.key, e.data);
-        dc.onopen = () => this._notify('OnPeerState', peer.key, 'datachannel-open');
+        dc.onmessage = e => {
+            // Viewer size reports are handled here; everything else (chat, media state) goes to .NET.
+            if (typeof e.data === 'string' && e.data.startsWith('{"hv":')) {
+                try {
+                    peer.remoteView = JSON.parse(e.data).hv;
+                    this._applyEncoding(peer);
+                } catch { /* ignore malformed */ }
+                return;
+            }
+            this._notify('OnData', peer.key, e.data);
+        };
+        dc.onopen = () => {
+            peer.reportedView = undefined; // (re)send our view size on a fresh channel
+            this._scheduleViewReport();
+            this._notify('OnPeerState', peer.key, 'datachannel-open');
+        };
         peer.dc = dc;
         this._addLocalTracks(peer);
         if (initiator) {
@@ -196,6 +371,76 @@ class Engine {
                 peer.pc.addTrack(track, this.localStream);
             }
         }
+    }
+
+    // ---- receiver-driven sizing ----
+    // Each side reports, per peer, the largest size (in device pixels) it draws that peer's video at,
+    // or 0x0 when it draws none. The sender then encodes for that viewer only: scaled down to that size,
+    // bitrate scaled with the pixel count, or switched off entirely while nobody is looking.
+
+    _scheduleViewReport() {
+        if (this.viewReportTimer) return;
+        this.viewReportTimer = setTimeout(() => {
+            this.viewReportTimer = null;
+            this._reportViews();
+        }, 200);
+    }
+
+    _reportViews() {
+        for (const peer of this.peers.values()) {
+            if (peer.dc?.readyState !== 'open') continue;
+            const view = this._renderedSize(peer.key);
+            if (peer.reportedView && peer.reportedView[0] === view[0] && peer.reportedView[1] === view[1]) continue;
+            peer.reportedView = view;
+            peer.dc.send(JSON.stringify({ hv: view }));
+        }
+    }
+
+    _renderedSize(key) {
+        let width = 0, height = 0;
+        for (const element of this.views.get(key) || []) {
+            if (element.tagName !== 'VIDEO' || !element.isConnected) continue;
+            width = Math.max(width, element.clientWidth);
+            height = Math.max(height, element.clientHeight);
+        }
+        // Round up to 32 device pixels so small layout jitter doesn't cause re-encoding churn.
+        const ratio = window.devicePixelRatio || 1;
+        const round = n => n <= 0 ? 0 : Math.ceil(n * ratio / 32) * 32;
+        return [round(width), round(height)];
+    }
+
+    _applyEncoding(peer) {
+        // setParameters must not overlap on one sender, so chain the updates.
+        peer.encodingUpdate = (peer.encodingUpdate || Promise.resolve()).then(async () => {
+            const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
+            if (!sender) return;
+            const parameters = sender.getParameters();
+            const encoding = parameters.encodings?.[0];
+            if (!encoding) return; // not negotiated yet; applied again on 'connected'
+
+            const s = this.videoSettings;
+            const view = peer.remoteView;
+            if (view && (view[0] === 0 || view[1] === 0)) {
+                encoding.active = false;
+            } else {
+                const captured = sender.track.getSettings();
+                const width = captured.width || s.maxWidth, height = captured.height || s.maxHeight;
+                // Until the viewer reports, send the configured maximum.
+                const scale = view ? Math.max(1, Math.min(width / view[0], height / view[1])) : 1;
+                encoding.active = true;
+                encoding.scaleResolutionDownBy = scale;
+                encoding.maxFramerate = s.maxFrameRate;
+                encoding.maxBitrate = Math.round(Math.max(30, s.maxBitrateKbps / (scale * scale)) * 1000);
+                // We already send only the size the viewer draws, so when bandwidth is short drop frames rather
+                // than starting blurry and stepping resolution back up over many seconds.
+                parameters.degradationPreference = 'maintain-resolution';
+            }
+            try {
+                await sender.setParameters(parameters);
+            } catch (e) {
+                console.warn('holler: could not apply video encoding', e);
+            }
+        });
     }
 
     async _addIce(peer, candidate) {

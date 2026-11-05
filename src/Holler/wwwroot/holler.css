@@ -44,6 +44,21 @@
 }
 
 .holler-error { color: var(--holler-danger); font-size: .875rem; padding: .5rem .75rem; }
+.holler-permission { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+
+.holler-media-controls { display: inline-flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+.holler-device-group { display: inline-flex; align-items: center; gap: .25rem; }
+.holler-device {
+    max-width: 11rem;
+    padding: .35rem .5rem;
+    border: 0;
+    border-radius: 999px;
+    font: inherit;
+    font-size: .8rem;
+    color: var(--holler-fg);
+    background: #2c3039;
+    cursor: pointer;
+}
 
 /* 1:1 call */
 .holler-call {
@@ -60,6 +75,7 @@
 .holler-placeholder {
     position: absolute;
     inset: 0;
+    background: var(--holler-tile);
     display: grid;
     place-items: center;
     font-size: 1.5rem;

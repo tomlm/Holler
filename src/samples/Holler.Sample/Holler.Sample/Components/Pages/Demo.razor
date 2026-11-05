@@ -18,7 +18,7 @@ else
     <p class="text-muted">Render mode: <strong>@Mode</strong> · signed in as <strong>@HttpContext.User.Identity.Name</strong> · <a href="">home</a></p>
     @if (IsRoom)
     {
-        <RoomDemo @rendermode="RenderMode" />
+        <RoomDemo @rendermode="RenderMode" InitialRoom="@Room" />
     }
     else
     {
@@ -30,6 +30,8 @@ else
     [CascadingParameter] private HttpContext? HttpContext { get; set; }
 
     [Parameter] public string Mode { get; set; } = "";
+
+    [SupplyParameterFromQuery] public string? Room { get; set; }
 
     private bool IsRoom => Navigation.ToBaseRelativePath(Navigation.Uri).StartsWith("room/", StringComparison.OrdinalIgnoreCase);
 
