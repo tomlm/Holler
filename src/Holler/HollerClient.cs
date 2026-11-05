@@ -61,6 +61,15 @@ public sealed class HollerClient : IAsyncDisposable
     public bool MicrophoneEnabled { get; private set; } = true;
     public bool CameraEnabled { get; private set; } = true;
 
+    /// <summary>A microphone is running and not muted: what a mute button should show.</summary>
+    public bool IsMicrophoneOn => MicrophoneEnabled && LocalMedia is { Audio: true };
+
+    /// <summary>A camera is running and not hidden: what a show/hide video button should show.</summary>
+    public bool IsCameraOn => CameraEnabled && LocalMedia is { Video: true };
+
+    // What the app last asked StartMediaAsync for, so a retry asks for the same.
+    private (bool Audio, bool Video)? _requestedMedia;
+
     public IReadOnlyList<HollerCall> Calls { get { lock (_sync) return _calls.Values.ToArray(); } }
     public IReadOnlyList<HollerRoom> Rooms { get { lock (_sync) return _rooms.Values.ToArray(); } }
     public IReadOnlyList<string> OnlineUsers { get { lock (_sync) return _online.Order().ToArray(); } }
@@ -132,16 +141,24 @@ public sealed class HollerClient : IAsyncDisposable
     }
 
     /// <summary>Requests the camera and/or microphone. Falls back to audio only if the camera is unavailable.</summary>
-    public async Task<HollerMediaResult> StartMediaAsync(bool audio = true, bool video = true)
+    /// <param name="audio">Request a microphone.</param>
+    /// <param name="video">Request a camera.</param>
+    /// <param name="videoSettings">
+    /// Upper bounds for the video you send. Each viewer is only sent the resolution it actually draws your video
+    /// at (and nothing while it isn't shown), so these are ceilings, not what every viewer receives.
+    /// </param>
+    public async Task<HollerMediaResult> StartMediaAsync(bool audio = true, bool video = true, HollerVideoSettings? videoSettings = null)
     {
         await StartAsync();
+        _requestedMedia = (audio, video);
         if (LocalMedia is { Ok: true })
             return LocalMedia;
         var result = await Exclusive(async () =>
-            await _engine!.InvokeAsync<HollerMediaResult>("startMedia", audio, video));
+            await _engine!.InvokeAsync<HollerMediaResult>("startMedia", audio, video, videoSettings ?? new HollerVideoSettings()));
         LocalMedia = result;
         if (result.Ok)
         {
+            await RefreshDeviceIdsAsync();
             await SetMicrophoneAsync(MicrophoneEnabled);
             await SetCameraAsync(CameraEnabled);
         }
@@ -149,11 +166,134 @@ public sealed class HollerClient : IAsyncDisposable
         return result;
     }
 
+    /// <summary>
+    /// Asks again for whatever <see cref="StartMediaAsync"/> requested but didn't get, e.g. after the user allowed
+    /// a blocked camera in the address bar. Anything already running carries on undisturbed.
+    /// </summary>
+    public async Task<HollerMediaResult> RetryMediaAsync()
+    {
+        if (_requestedMedia is not { } requested || _engine is null)
+            return LocalMedia ?? new HollerMediaResult(false, false, false, "Media was never requested");
+        var result = await Exclusive(async () =>
+            await _engine.InvokeAsync<HollerMediaResult>("retryMedia", requested.Audio, requested.Video));
+        LocalMedia = result;
+        if (result.Ok)
+        {
+            await RefreshDeviceIdsAsync();
+            await SetMicrophoneAsync(MicrophoneEnabled);
+            await SetCameraAsync(CameraEnabled);
+        }
+        NotifyChanged();
+        return result;
+    }
+
+    private bool MissingRequestedMedia =>
+        _requestedMedia is { } requested &&
+        ((requested.Audio && LocalMedia is not { Audio: true }) || (requested.Video && LocalMedia is not { Video: true }));
+
+    private Task OnMediaPermissionChangedAsync(string name, string state) => Post(async () =>
+    {
+        // "prompt" means the user reset a block, so asking now shows the browser's prompt again.
+        if (state is "granted" or "prompt" && MissingRequestedMedia)
+        {
+            try
+            {
+                await RetryMediaAsync();
+            }
+            catch (Exception ex) when (ex is not JSDisconnectedException)
+            {
+                _logger.LogWarning(ex, "Holler failed to restart media after the {Name} permission changed", name);
+            }
+        }
+    });
+
+    public Task ToggleMicrophoneAsync() => SetMicrophoneAsync(!MicrophoneEnabled);
+
+    public Task ToggleCameraAsync() => SetCameraAsync(!CameraEnabled);
+
+    /// <summary>Cameras, with a fallback name ("Camera 1") for any the browser doesn't label.</summary>
+    public async Task<IReadOnlyList<HollerMediaDevice>> GetCamerasAsync() => Labelled(await GetDevicesAsync(), "video", "Camera");
+
+    /// <summary>Microphones, with a fallback name ("Microphone 1") for any the browser doesn't label.</summary>
+    public async Task<IReadOnlyList<HollerMediaDevice>> GetMicrophonesAsync() => Labelled(await GetDevicesAsync(), "audio", "Microphone");
+
+    private static HollerMediaDevice[] Labelled(IEnumerable<HollerMediaDevice> devices, string kind, string noun) =>
+        devices.Where(d => d.Kind == kind)
+            .Select((d, i) => string.IsNullOrWhiteSpace(d.Label) ? d with { Label = $"{noun} {i + 1}" } : d)
+            .ToArray();
+
+    /// <summary>The camera in use (a <see cref="HollerMediaDevice.DeviceId"/>), if any.</summary>
+    public string? CameraDeviceId { get; private set; }
+
+    /// <summary>The microphone in use, if any.</summary>
+    public string? MicrophoneDeviceId { get; private set; }
+
+    /// <summary>
+    /// Lists cameras and microphones. Labels are empty until the user has granted media permission,
+    /// so call this after <see cref="StartMediaAsync"/>.
+    /// </summary>
+    public async Task<IReadOnlyList<HollerMediaDevice>> GetDevicesAsync()
+    {
+        await StartAsync();
+        return await _engine!.InvokeAsync<HollerMediaDevice[]>("listDevices");
+    }
+
+    /// <summary>Switches to another camera without interrupting calls. The choice is remembered by the browser.</summary>
+    public Task<HollerMediaResult> SelectCameraAsync(string deviceId) => SelectDeviceAsync("video", deviceId);
+
+    /// <summary>Switches to another microphone without interrupting calls. The choice is remembered by the browser.</summary>
+    public Task<HollerMediaResult> SelectMicrophoneAsync(string deviceId) => SelectDeviceAsync("audio", deviceId);
+
+    private async Task<HollerMediaResult> SelectDeviceAsync(string kind, string deviceId)
+    {
+        if (LocalMedia is not { Ok: true } media)
+            return new HollerMediaResult(false, false, false, "Media not started");
+        var switched = await Exclusive(async () =>
+            await _engine!.InvokeAsync<SwitchResult>("switchDevice", kind, deviceId));
+        if (!switched.Ok)
+            return new HollerMediaResult(false, media.Audio, media.Video, switched.Error);
+        // Switching can add a kind we didn't have, e.g. plugging in a camera after starting audio-only.
+        LocalMedia = kind == "video" ? media with { Video = true } : media with { Audio = true };
+        await RefreshDeviceIdsAsync();
+        await SendMediaStateAsync(ConnectedPeers());
+        NotifyChanged();
+        return LocalMedia;
+    }
+
+    private async Task RefreshDeviceIdsAsync()
+    {
+        CameraDeviceId = await _engine!.InvokeAsync<string?>("currentDevice", "video");
+        MicrophoneDeviceId = await _engine!.InvokeAsync<string?>("currentDevice", "audio");
+    }
+
+    private sealed record SwitchResult(bool Ok, string? Error);
+
+    /// <summary>Releases the camera and microphone (the browser's recording indicator goes off).</summary>
+    public async Task StopMediaAsync()
+    {
+        if (_engine is null || LocalMedia is null)
+            return;
+        LocalMedia = null;
+        CameraDeviceId = MicrophoneDeviceId = null;
+        try
+        {
+            await _engine.InvokeVoidAsync("stopMedia");
+            await SendMediaStateAsync(ConnectedPeers());
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+        NotifyChanged();
+    }
+
     public async Task SetMicrophoneAsync(bool enabled)
     {
         MicrophoneEnabled = enabled;
         if (_engine is not null)
+        {
             await _engine.InvokeVoidAsync("setTrackEnabled", "audio", enabled);
+            await SendMediaStateAsync(ConnectedPeers());
+        }
         NotifyChanged();
     }
 
@@ -161,8 +301,28 @@ public sealed class HollerClient : IAsyncDisposable
     {
         CameraEnabled = enabled;
         if (_engine is not null)
+        {
             await _engine.InvokeVoidAsync("setTrackEnabled", "video", enabled);
+            await SendMediaStateAsync(ConnectedPeers());
+        }
         NotifyChanged();
+    }
+
+    private HollerPeer[] ConnectedPeers()
+    {
+        lock (_sync) return _peers.Values.Where(p => p.DataChannelOpen).ToArray();
+    }
+
+    /// <summary>Tells peers whether we are actually sending audio/video, so they can show a placeholder instead of a black frame.</summary>
+    private async Task SendMediaStateAsync(IEnumerable<HollerPeer> peers)
+    {
+        if (_engine is null)
+            return;
+        var json = JsonSerializer.Serialize(new DataMessage(null, null,
+            Audio: MicrophoneEnabled && LocalMedia is { Audio: true },
+            Video: CameraEnabled && LocalMedia is { Video: true }));
+        foreach (var peer in peers)
+            await _engine.InvokeAsync<bool>("sendData", peer.Key, json);
     }
 
     /// <summary>Rings every session of <paramref name="userId"/>. Returns the existing call if one is active.</summary>
@@ -538,6 +698,8 @@ public sealed class HollerClient : IAsyncDisposable
             if (call is not null && state == "connected")
                 call.State = HollerCallState.Connected;
         }
+        if (state == "datachannel-open")
+            await SendMediaStateAsync([peer]);
         if (call is not null && state is "failed" or "closed")
         {
             await EndCallAsync(call, "Connection lost");
@@ -572,7 +734,18 @@ public sealed class HollerClient : IAsyncDisposable
         catch (JsonException)
         {
         }
-        if (peer is null || data?.Text is null)
+        if (peer is null || data is null)
+            return Task.CompletedTask;
+        if (data.Audio is not null || data.Video is not null)
+        {
+            lock (_sync)
+            {
+                peer.AudioEnabled = data.Audio ?? peer.AudioEnabled;
+                peer.VideoEnabled = data.Video ?? peer.VideoEnabled;
+            }
+            NotifyChanged();
+        }
+        if (data.Text is null)
             return Task.CompletedTask;
         var conversation = peer.Room is not null ? RoomConversation(peer.Room) : CallConversation(peer.UserId);
         var message = new HollerChatMessage(conversation, peer.UserId, data.Text, DateTimeOffset.Now, IsLocal: false);
@@ -706,7 +879,8 @@ public sealed class HollerClient : IAsyncDisposable
         _callbacks?.Dispose();
     }
 
-    private sealed record DataMessage(string? Room, string Text);
+    /// <summary>Data channel message: chat (<see cref="Text"/>) and/or the sender's media state.</summary>
+    private sealed record DataMessage(string? Room, string? Text, bool? Audio = null, bool? Video = null);
 
     /// <summary>Target for callbacks from holler.js; kept separate so <see cref="HollerClient"/> has no public JSInvokable surface.</summary>
     private sealed class JsCallbacks(HollerClient client)
@@ -715,5 +889,6 @@ public sealed class HollerClient : IAsyncDisposable
         [JSInvokable] public Task OnPeerState(string key, string state) => client.OnPeerStateAsync(key, state);
         [JSInvokable] public Task OnRemoteTrack(string key, string kind) => client.OnRemoteTrackAsync(key, kind);
         [JSInvokable] public Task OnData(string key, string json) => client.OnDataAsync(key, json);
+        [JSInvokable] public Task OnMediaPermissionChanged(string name, string state) => client.OnMediaPermissionChangedAsync(name, state);
     }
 }

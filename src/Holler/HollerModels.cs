@@ -50,6 +50,15 @@ public sealed class HollerPeer
     public string ConnectionState { get; internal set; } = "new";
     public bool HasAudio { get; internal set; }
     public bool HasVideo { get; internal set; }
+
+    /// <summary>The peer's microphone is on (they haven't muted, and they have one).</summary>
+    public bool AudioEnabled { get; internal set; } = true;
+
+    /// <summary>The peer's camera is on. False while they have hidden their video.</summary>
+    public bool VideoEnabled { get; internal set; } = true;
+
+    /// <summary>There is live video to show: a video track has arrived and the peer hasn't turned the camera off.</summary>
+    public bool IsVideoVisible => HasVideo && VideoEnabled;
     public bool DataChannelOpen { get; internal set; }
 
     internal bool Created { get; set; }
@@ -69,4 +78,22 @@ public sealed class HollerRoom
 public sealed record HollerChatMessage(string Conversation, string FromUserId, string Text, DateTimeOffset At, bool IsLocal);
 
 /// <summary>Result of requesting the local camera and microphone.</summary>
-public sealed record HollerMediaResult(bool Ok, bool Audio, bool Video, string? Error);
+/// <param name="Ok">Some media is running (possibly only audio).</param>
+/// <param name="Audio">A microphone is running.</param>
+/// <param name="Video">A camera is running.</param>
+/// <param name="Error">Why something requested isn't running, if anything.</param>
+/// <param name="PermissionDenied">
+/// The user (or browser policy) blocked the camera or microphone. Browsers won't ask again on their own: the
+/// user has to allow it from the address bar. Holler retries automatically when the browser reports the change,
+/// and <c>HollerClient.RetryMediaAsync</c> retries on demand.
+/// </param>
+public sealed record HollerMediaResult(bool Ok, bool Audio, bool Video, string? Error, bool PermissionDenied = false);
+
+/// <summary>A camera (<see cref="Kind"/> "video") or microphone ("audio").</summary>
+public sealed record HollerMediaDevice(string DeviceId, string Kind, string Label);
+
+/// <summary>
+/// Upper bounds for outgoing video. The camera captures at most this, and each viewer gets a copy scaled down
+/// to the size it renders the video at, with the bitrate scaled to match.
+/// </summary>
+public sealed record HollerVideoSettings(int MaxWidth = 1280, int MaxHeight = 720, int MaxFrameRate = 30, int MaxBitrateKbps = 1500);

@@ -1,0 +1,90 @@
+@inherits HollerComponentBase
+
+@*
+    Mute / hide-video buttons, each with a device picker, plus guidance when the browser has blocked the camera
+    or microphone. Plain HTML styled by holler.css; for another UI library, build the same thing from
+    HollerClient (IsMicrophoneOn, ToggleMicrophoneAsync, GetMicrophonesAsync, SelectMicrophoneAsync, ...).
+*@
+<span class="holler-media-controls @Class">
+    <span class="holler-device-group">
+        <button type="button" class="holler-btn @(Holler.IsMicrophoneOn ? "" : "holler-off")"
+                title="@(Holler.IsMicrophoneOn ? "Mute microphone" : "Unmute microphone")"
+                disabled="@(Holler.LocalMedia is not { Audio: true })"
+                @onclick="() => Run(Holler.ToggleMicrophoneAsync)">
+            @(Holler.IsMicrophoneOn ? "Mute" : "Unmute")
+        </button>
+        @if (ShowDevicePickers && Holler.LocalMedia is { Audio: true })
+        {
+            <select class="holler-device" aria-label="Microphone" value="@Holler.MicrophoneDeviceId"
+                    @onfocus="RefreshDevicesAsync" @onchange="e => Run(() => Holler.SelectMicrophoneAsync(e.Value as string ?? string.Empty))">
+                @foreach (var device in _microphones)
+                {
+                    <option value="@device.DeviceId">@device.Label</option>
+                }
+            </select>
+        }
+    </span>
+    <span class="holler-device-group">
+        <button type="button" class="holler-btn @(Holler.IsCameraOn ? "" : "holler-off")"
+                title="@(Holler.IsCameraOn ? "Turn camera off" : "Turn camera on")"
+                disabled="@(Holler.LocalMedia is not { Video: true })"
+                @onclick="() => Run(Holler.ToggleCameraAsync)">
+            @(Holler.IsCameraOn ? "Camera off" : "Camera on")
+        </button>
+        @if (ShowDevicePickers && Holler.LocalMedia is { Video: true })
+        {
+            <select class="holler-device" aria-label="Camera" value="@Holler.CameraDeviceId"
+                    @onfocus="RefreshDevicesAsync" @onchange="e => Run(() => Holler.SelectCameraAsync(e.Value as string ?? string.Empty))">
+                @foreach (var device in _cameras)
+                {
+                    <option value="@device.DeviceId">@device.Label</option>
+                }
+            </select>
+        }
+    </span>
+</span>
+
+@if (Holler.LocalMedia is { PermissionDenied: true })
+{
+    <div class="holler-error holler-permission" role="alert">
+        Camera or microphone is blocked. Click the camera icon in the address bar, choose <strong>Allow</strong>, then
+        <button type="button" class="holler-btn holler-primary" @onclick="() => Run(Holler.RetryMediaAsync)">Try again</button>
+    </div>
+}
+else if (Error is not null || Holler.LocalMedia is { Ok: false })
+{
+    <div class="holler-error">@(Error ?? Holler.LocalMedia?.Error)</div>
+}
+
+@code {
+    /// <summary>Show a camera and microphone picker next to each button.</summary>
+    [Parameter] public bool ShowDevicePickers { get; set; } = true;
+
+    [Parameter] public string? Class { get; set; }
+
+    private IReadOnlyList<HollerMediaDevice> _cameras = [];
+    private IReadOnlyList<HollerMediaDevice> _microphones = [];
+    private bool _loaded;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        await base.OnAfterRenderAsync(firstRender);
+        // Device names are only available once media permission is granted.
+        if (!_loaded && Holler.LocalMedia is { Ok: true })
+        {
+            _loaded = true;
+            await RefreshDevicesAsync();
+            StateHasChanged();
+        }
+    }
+
+    // Re-read when a picker gets focus, so newly plugged-in devices show up.
+    private async Task RefreshDevicesAsync()
+    {
+        await Run(async () =>
+        {
+            _cameras = await Holler.GetCamerasAsync();
+            _microphones = await Holler.GetMicrophonesAsync();
+        });
+    }
+}

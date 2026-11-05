@@ -1,7 +1,7 @@
 @implements IAsyncDisposable
 @inject HollerClient Holler
 
-<video @ref="_video" class="holler-video @Class" autoplay playsinline muted="@Local"></video>
+<video @ref="_video" class="holler-video @Class" style="@Style" autoplay playsinline disablepictureinpicture muted="@(Local || Muted)"></video>
 
 @code {
     /// <summary>The remote peer whose stream to show.</summary>
@@ -10,7 +10,14 @@
     /// <summary>Show the local camera instead of a peer (always muted).</summary>
     [Parameter] public bool Local { get; set; }
 
+    /// <summary>
+    /// Silence this element, e.g. when the peer's audio plays through a separate <c>HollerAudio</c> so it keeps
+    /// playing while this video is hidden.
+    /// </summary>
+    [Parameter] public bool Muted { get; set; }
+
     [Parameter] public string? Class { get; set; }
+    [Parameter] public string? Style { get; set; }
 
     private ElementReference _video;
     private string? _attached;
@@ -25,7 +32,7 @@
             await Holler.DetachAsync(_video, _attached);
         _attached = StreamKey;
         if (_attached is not null)
-            await Holler.AttachAsync(_video, _attached, Local);
+            await Holler.AttachAsync(_video, _attached, Local || Muted);
     }
 
     public async ValueTask DisposeAsync()
