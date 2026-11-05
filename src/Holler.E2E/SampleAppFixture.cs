@@ -1,6 +1,3 @@
-using System.Diagnostics;
-using System.Net;
-using System.Net.Sockets;
 using Microsoft.Playwright;
 
 namespace Holler.E2E;
@@ -24,7 +21,7 @@ public sealed class SampleAppFixture
     /// <summary>Short enough to test "no answer", long enough for the other tests to answer.</summary>
     public static TimeSpan RingTimeout { get; } = TimeSpan.FromSeconds(8);
 
-    private static Process? _app;
+    private static SampleApp? _app;
     private static IPlaywright? _playwright;
     private static string? _skipReason;
 
@@ -63,41 +60,8 @@ public sealed class SampleAppFixture
             return;
         }
 
-        var port = GetFreePort();
-        BaseUrl = $"http://127.0.0.1:{port}/";
-        var project = Path.Combine(FindRepoRoot(), "src", "samples", "Holler.Sample", "Holler.Sample");
-        var start = new ProcessStartInfo("dotnet", ["run", "--project", project, "-c", BuildConfiguration, "--no-build", "--no-launch-profile", "--urls", BaseUrl])
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
-        start.Environment["ASPNETCORE_ENVIRONMENT"] = "Development";
-        start.Environment["Holler__RingTimeout"] = RingTimeout.ToString();
-        _app = Process.Start(start) ?? throw new InvalidOperationException("Could not start the sample app.");
-        _app.OutputDataReceived += (_, e) => { if (e.Data is not null) TestContext.Progress.WriteLine($"[app] {e.Data}"); };
-        _app.ErrorDataReceived += (_, e) => { if (e.Data is not null) TestContext.Progress.WriteLine($"[app] {e.Data}"); };
-        _app.BeginOutputReadLine();
-        _app.BeginErrorReadLine();
-
-        using var http = new HttpClient();
-        var deadline = DateTime.UtcNow.AddSeconds(90);
-        while (true)
-        {
-            if (_app.HasExited)
-                throw new InvalidOperationException($"Sample app exited with code {_app.ExitCode}.");
-            try
-            {
-                if ((await http.GetAsync(BaseUrl)).IsSuccessStatusCode)
-                    break;
-            }
-            catch (HttpRequestException)
-            {
-            }
-            if (DateTime.UtcNow > deadline)
-                throw new TimeoutException($"Sample app did not respond at {BaseUrl}.");
-            await Task.Delay(500);
-        }
+        _app = await SampleApp.StartAsync(new Dictionary<string, string> { ["Holler__RingTimeout"] = RingTimeout.ToString() });
+        BaseUrl = _app.BaseUrl;
     }
 
     [OneTimeTearDown]
@@ -108,35 +72,7 @@ public sealed class SampleAppFixture
         if (BrowserWithRealPermissions is not null)
             await BrowserWithRealPermissions.CloseAsync();
         _playwright?.Dispose();
-        if (_app is { HasExited: false })
-        {
-            _app.Kill(entireProcessTree: true);
-            await _app.WaitForExitAsync();
-        }
-        _app?.Dispose();
-    }
-
-    // The sample was built alongside these tests, in the same configuration.
-#if DEBUG
-    private const string BuildConfiguration = "Debug";
-#else
-    private const string BuildConfiguration = "Release";
-#endif
-
-    private static int GetFreePort()
-    {
-        using var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        return ((IPEndPoint)listener.LocalEndpoint).Port;
-    }
-
-    private static string FindRepoRoot()
-    {
-        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
-        {
-            if (File.Exists(Path.Combine(dir.FullName, "src", "Holler.slnx")))
-                return dir.FullName;
-        }
-        throw new DirectoryNotFoundException("Could not find the repo root (src/Holler.slnx).");
+        if (_app is not null)
+            await _app.DisposeAsync();
     }
 }

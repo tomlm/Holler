@@ -4,9 +4,9 @@
 const LOCAL = 'local';
 
 class Engine {
-    constructor(dotnet, iceServers) {
+    constructor(dotnet, iceConfiguration) {
         this.dotnet = dotnet;
-        this.setIceServers(iceServers);
+        this.setIceConfiguration(iceConfiguration);
         this.localStream = null;
         this.peers = new Map();   // key -> peer
         this.streams = new Map(); // key -> MediaStream
@@ -31,13 +31,14 @@ class Engine {
     }
 
     // Applies to peer connections created afterwards (e.g. refreshed TURN credentials).
-    setIceServers(iceServers) {
-        this.iceServers = (iceServers || []).map(s => {
+    setIceConfiguration(configuration) {
+        this.iceServers = (configuration?.iceServers || []).map(s => {
             const server = { urls: s.urls };
             if (s.username) server.username = s.username;
             if (s.credential) server.credential = s.credential;
             return server;
         });
+        this.relayOnly = !!configuration?.relayOnly;
     }
 
     async startMedia(audio, video, videoSettings) {
@@ -229,7 +230,10 @@ class Engine {
 
     createPeer(key, polite, initiator) {
         if (this.peers.has(key)) return;
-        const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+        const pc = new RTCPeerConnection({
+            iceServers: this.iceServers,
+            iceTransportPolicy: this.relayOnly ? 'relay' : 'all',
+        });
         const peer = {
             key, pc, polite,
             makingOffer: false, ignoreOffer: false, settingRemoteAnswer: false,
@@ -467,6 +471,6 @@ class Engine {
     }
 }
 
-export function createEngine(dotnet, iceServers) {
-    return new Engine(dotnet, iceServers);
+export function createEngine(dotnet, iceConfiguration) {
+    return new Engine(dotnet, iceConfiguration);
 }

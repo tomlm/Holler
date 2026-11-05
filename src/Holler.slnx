@@ -4,6 +4,7 @@
     <Project Path="samples/Holler.Sample/Holler.Sample.Client/Holler.Sample.Client.csproj" />
     <Project Path="samples/Holler.Sample/Holler.Sample/Holler.Sample.csproj" />
   </Folder>
+  <Project Path="Holler.Cloudflare/Holler.Cloudflare.csproj" />
   <Project Path="Holler.E2E/Holler.E2E.csproj" />
   <Project Path="Holler.Server/Holler.Server.csproj" />
   <Project Path="Holler.Tests/Holler.Tests.csproj" />

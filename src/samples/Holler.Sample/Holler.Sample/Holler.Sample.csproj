@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <BlazorDisableThrowNavigationException>true</BlazorDisableThrowNavigationException>
+    <UserSecretsId>holler-sample</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\Holler.Server\Holler.Server.csproj" />
+    <ProjectReference Include="..\..\..\Holler.Cloudflare\Holler.Cloudflare.csproj" />
   </ItemGroup>
 
 </Project>

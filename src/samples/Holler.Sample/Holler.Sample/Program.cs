@@ -24,6 +24,11 @@ builder.Services.AddHoller(o =>
 //   "Holler": { "RingTimeout": "00:00:30", "Turn": { "Urls": [ "turn:turn.example.com:3478" ], "SharedSecret": "..." } }
 builder.Services.Configure<Holler.Server.HollerOptions>(builder.Configuration.GetSection("Holler"));
 
+// TURN for users behind strict NATs and firewalls: Cloudflare Realtime TURN, when a key is configured
+// (Holler:CloudflareTurn:KeyId and ApiToken, e.g. in user secrets).
+if (!string.IsNullOrWhiteSpace(builder.Configuration["Holler:CloudflareTurn:KeyId"]))
+    builder.Services.AddHollerCloudflareTurn();
+
 var app = builder.Build();
 
 if (app.Environment.IsDevelopment())

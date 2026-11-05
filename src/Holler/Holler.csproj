@@ -4,16 +4,36 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <PackageId>Holler</PackageId>
-    <Version>0.1.0</Version>
-    <Description>Dead-simple peer-to-peer WebRTC video calls, rooms and data chat for Blazor. Media flows browser-to-browser; SignalR is only used for signaling.</Description>
-    <Authors>Tom Laird-McConnell</Authors>
-    <PackageTags>blazor;webrtc;signalr;video;p2p</PackageTags>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>Holler</PackageId>
+    <Version>0.9.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <Description>Dead-simple peer-to-peer WebRTC video calls, rooms and data chat for Blazor. Media flows browser-to-browser; SignalR is only used for signaling.</Description>
+    <Authors>Tom Laird-McConnell</Authors>
+    <Company>Iciclecreek</Company>
+    <PackageTags>blazor;webrtc;signalr;video;p2p</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tomlm/Holler</PackageProjectUrl>
+    <PackageIconUrl>https://raw.githubusercontent.com/tomlm/Holler/main/icon.png</PackageIconUrl>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <RepositoryUrl>https://github.com/tomlm/Holler</RepositoryUrl>
+    <Copyright>Tom Laird-McConnell All Rights Reserved</Copyright>
+    <RootNamespace>Holler</RootNamespace>
+    <ContentTargetFolders>content</ContentTargetFolders>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="" />
+    <None Include="../../icon.png" Pack="true" PackagePath="" />
+  </ItemGroup>
 
   <ItemGroup>
     <SupportedPlatform Include="browser" />
@@ -25,7 +45,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
     <InternalsVisibleTo Include="Holler.Server" />
     <InternalsVisibleTo Include="Holler.Tests" />
   </ItemGroup>

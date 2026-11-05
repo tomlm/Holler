@@ -108,8 +108,8 @@ public sealed class InProcessSignalingChannel(
 
     public Task LeaveRoomAsync(string room) => router.LeaveRoomAsync(Session.SessionId, room);
 
-    public async Task<IReadOnlyList<HollerIceServer>> GetIceServersAsync() =>
-        await iceServers.GetIceServersAsync(Session.UserId);
+    public async Task<HollerIceConfiguration> GetIceConfigurationAsync() =>
+        new(await iceServers.GetIceServersAsync(Session.UserId), options.Value.ForceRelay);
 
     public Task<IReadOnlyList<string>> GetOnlineUsersAsync() => Task.FromResult(router.GetOnlineUsers());
 

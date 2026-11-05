@@ -6,9 +6,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <!-- Holds the Cloudflare TURN key for the relay test: dotnet user-secrets set "Holler:CloudflareTurn:KeyId" ... -->
+    <UserSecretsId>holler-e2e</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="10.0.14" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.0" />
     <PackageReference Include="Microsoft.Playwright" Version="1.64.1" />
     <PackageReference Include="NUnit" Version="4.3.2" />

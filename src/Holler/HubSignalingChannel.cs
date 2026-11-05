@@ -60,8 +60,8 @@ public sealed class HubSignalingChannel : ISignalingChannel
 
     public Task LeaveRoomAsync(string room) => _connection.InvokeAsync("LeaveRoom", room);
 
-    public Task<IReadOnlyList<HollerIceServer>> GetIceServersAsync() =>
-        _connection.InvokeAsync<IReadOnlyList<HollerIceServer>>("GetIceServers");
+    public Task<HollerIceConfiguration> GetIceConfigurationAsync() =>
+        _connection.InvokeAsync<HollerIceConfiguration>("GetIceConfiguration");
 
     public Task<IReadOnlyList<string>> GetOnlineUsersAsync() =>
         _connection.InvokeAsync<IReadOnlyList<string>>("GetOnlineUsers");

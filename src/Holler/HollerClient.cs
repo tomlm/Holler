@@ -117,10 +117,10 @@ public sealed class HollerClient : IAsyncDisposable
             // (the Blazor Server circuit's renderer, or the WebAssembly main thread).
             _context = SynchronizationContext.Current;
             _session = await _channel.StartAsync();
-            var iceServers = await _channel.GetIceServersAsync();
+            var iceConfiguration = await _channel.GetIceConfigurationAsync();
             _module = await _js.InvokeAsync<IJSObjectReference>("import", ModulePath);
             _callbacks = DotNetObjectReference.Create(new JsCallbacks(this));
-            _engine = await _module.InvokeAsync<IJSObjectReference>("createEngine", _callbacks, iceServers);
+            _engine = await _module.InvokeAsync<IJSObjectReference>("createEngine", _callbacks, iceConfiguration);
             _iceServersFetched = DateTimeOffset.UtcNow;
 
             var online = await _channel.GetOnlineUsersAsync();
@@ -487,8 +487,8 @@ public sealed class HollerClient : IAsyncDisposable
             return;
         try
         {
-            var iceServers = await _channel.GetIceServersAsync();
-            await _engine.InvokeVoidAsync("setIceServers", iceServers);
+            var iceConfiguration = await _channel.GetIceConfigurationAsync();
+            await _engine.InvokeVoidAsync("setIceConfiguration", iceConfiguration);
             _iceServersFetched = DateTimeOffset.UtcNow;
         }
         catch (Exception ex) when (ex is not JSDisconnectedException)
