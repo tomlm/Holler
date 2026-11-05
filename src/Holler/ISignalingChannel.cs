@@ -16,7 +16,7 @@ public interface ISignalingChannel : IAsyncDisposable
 
     Task LeaveRoomAsync(string room);
 
-    Task<IReadOnlyList<HollerIceServer>> GetIceServersAsync();
+    Task<HollerIceConfiguration> GetIceConfigurationAsync();
 
     Task<IReadOnlyList<string>> GetOnlineUsersAsync();
 

@@ -24,6 +24,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Holler\Holler.csproj" />
     <ProjectReference Include="..\Holler.Server\Holler.Server.csproj" />
+    <ProjectReference Include="..\Holler.Cloudflare\Holler.Cloudflare.csproj" />
   </ItemGroup>
 
 </Project>

@@ -20,6 +20,13 @@ public sealed class HollerOptions
     /// </summary>
     public bool RequireAuthorization { get; set; } = true;
 
+    /// <summary>
+    /// Send all media through TURN relays (browsers use <c>iceTransportPolicy: "relay"</c>). Use it to prove a TURN
+    /// setup works, or to keep players' IP addresses hidden from each other. Without a reachable TURN server,
+    /// nobody connects.
+    /// </summary>
+    public bool ForceRelay { get; set; }
+
     /// <summary>Maximum sessions per room. Rooms are a full mesh, so cost grows with the square of this.</summary>
     public int MaxRoomSize { get; set; } = 6;
 

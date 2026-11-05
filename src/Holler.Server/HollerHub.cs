@@ -58,8 +58,8 @@ public sealed class HollerHub(
 
     public Task LeaveRoom(string room) => router.LeaveRoomAsync(SessionId, room);
 
-    public async Task<IReadOnlyList<HollerIceServer>> GetIceServers() =>
-        await iceServers.GetIceServersAsync(Hello().UserId);
+    public async Task<HollerIceConfiguration> GetIceConfiguration() =>
+        new(await iceServers.GetIceServersAsync(Hello().UserId), options.Value.ForceRelay);
 
     public IReadOnlyList<string> GetOnlineUsers() => router.GetOnlineUsers();
 

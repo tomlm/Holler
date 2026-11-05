@@ -60,3 +60,11 @@ public sealed record HollerPeerInfo(string SessionId, string UserId);
 
 /// <summary>A STUN or TURN server, in the shape of <c>RTCIceServer</c>.</summary>
 public sealed record HollerIceServer(string[] Urls, string? Username = null, string? Credential = null);
+
+/// <summary>How browsers should find a route to each other.</summary>
+/// <param name="IceServers">STUN/TURN servers for this user.</param>
+/// <param name="RelayOnly">
+/// Only use TURN relays (<c>iceTransportPolicy: "relay"</c>). For proving a TURN setup works, or for hiding
+/// players' IP addresses from each other; connections fail if no TURN server is reachable.
+/// </param>
+public sealed record HollerIceConfiguration(IReadOnlyList<HollerIceServer> IceServers, bool RelayOnly = false);

@@ -1,3 +1,11 @@
+[![Build and Test](https://github.com/tomlm/Holler/actions/workflows/BuildAndRunTests.yml/badge.svg)](https://github.com/tomlm/Holler/actions/workflows/BuildAndRunTests.yml)[![NuGet](https://img.shields.io/nuget/v/Holler.svg)](https://www.nuget.org/packages/Holler)
+
+![Logo](https://raw.githubusercontent.com/tomlm/Holler/refs/heads/main/icon.png)
+
+# Holler
+
+![Screenshot](https://raw.githubusercontent.com/tomlm/Holler/refs/heads/main/screenshot.gif)
+
 # Holler
 
 Dead-simple peer-to-peer WebRTC video for Blazor.
@@ -117,12 +125,7 @@ builder.Services.AddHoller(o =>
 {
     o.HubPath = "/holler";                       // must match AddHollerClient(o => o.HubPath = "holler")
     o.IceServers = [new(["stun:stun.l.google.com:19302"])];
-    o.Turn = new()                               // needed for users behind strict NATs
-    {
-        Urls = ["turn:turn.example.com:3478", "turns:turn.example.com:5349"],
-        SharedSecret = builder.Configuration["Turn:Secret"]!,   // coturn static-auth-secret
-        CredentialLifetime = TimeSpan.FromHours(12),
-    };
+    o.ForceRelay = false;                        // true: all media through TURN (see TURN below)
     o.RingTimeout = TimeSpan.FromSeconds(45);    // then the caller gets "No answer"
     o.MaxRoomSize = 6;
     o.Limits.RingsPerMinute = 10;                // per session; also SignalsPerSecond, MaxPayloadLength, MaxRoomsPerSession
@@ -132,16 +135,68 @@ builder.Services.AddHoller(o =>
 
 `HollerOptions` binds from configuration as usual, e.g. `builder.Services.Configure<HollerOptions>(builder.Configuration.GetSection("Holler"))`.
 
-**TURN.** `Turn` uses coturn's shared-secret "TURN REST API" (`use-auth-secret`). Each user gets a credential
-that expires, derived from the secret. The secret itself never leaves the server. Clients re-fetch credentials before
-new connections once they are 10 minutes old.
+## TURN (for players behind strict NATs and firewalls)
 
-Extension points (register your own before `AddHoller`):
+Most players connect directly. Those on corporate networks, some mobile carriers, or carrier-grade NAT need a
+**TURN relay**, or they get no video at all. Holler gets ICE servers from an `IIceServerProvider`; pick one:
+
+**Cloudflare Realtime TURN** (package `Holler.Cloudflare`). Hosted, no servers to run; the first 1,000 GB a month
+is free, then $0.05/GB (check Cloudflare's current pricing). Only relayed players count.
+
+```csharp
+builder.Services.AddHoller();
+builder.Services.AddHollerCloudflareTurn();      // binds Holler:CloudflareTurn:KeyId / ApiToken / CredentialLifetime
+```
+
+Create a TURN key in the Cloudflare dashboard (Realtime, then TURN Server) and keep its token secret, e.g.
+`dotnet user-secrets set "Holler:CloudflareTurn:ApiToken" "..."` locally and app settings or Key Vault in production
+(`Holler__CloudflareTurn__ApiToken`).
+
+**Your own coturn** with its shared secret (`use-auth-secret`), no extra package:
+
+```csharp
+builder.Services.AddHoller(o => o.Turn = new()
+{
+    Urls = ["turn:turn.example.com:3478?transport=udp", "turns:turn.example.com:443?transport=tcp"],
+    SharedSecret = builder.Configuration["Turn:Secret"]!,   // coturn static-auth-secret
+});
+```
+
+**Any other TURN service** (Twilio, Metered, ...): derive from `TurnCredentialProvider` and implement one method
+that fetches credentials for a user. The base class caches each user's credentials until half their lifetime, adds
+your static STUN servers, drops URLs browsers can't use, and falls back to STUN only (direct connections) if the
+service is unreachable. Register it as the `IIceServerProvider`:
+
+```csharp
+public sealed class MyTurnProvider(IOptions<HollerOptions> options, TimeProvider time, ILogger<MyTurnProvider> logger)
+    : TurnCredentialProvider(options, time, logger)
+{
+    protected override async Task<TurnCredentials> FetchCredentialsAsync(string userId, CancellationToken ct)
+    {
+        // Call your provider's API...
+        return new TurnCredentials([new HollerIceServer(["turn:turn.example.com:3478"], "username", "password")],
+            ExpiresAt: Time.GetUtcNow().AddHours(12));
+    }
+}
+
+builder.Services.AddSingleton<IIceServerProvider, MyTurnProvider>();
+```
+
+Credentials are per user and short-lived, so secrets never reach the browser. Clients re-fetch them before new calls
+and room joins once they are 10 minutes old. A connection that is already relaying keeps the credentials it started
+with, so make their lifetime longer than a session (Cloudflare allows up to 48 hours; the default is 24).
+
+**Prove it works:** set `ForceRelay` (or `Holler__ForceRelay=true`) and every connection must go through TURN. If
+video still connects, your TURN setup works. It also hides players' IP addresses from each other.
+
+## Extension points
+
+Register your own before `AddHoller`:
 
 - `IHollerUserIdProvider` decides the user id people call. The default is the `NameIdentifier` claim, falling back to `Identity.Name`.
 - `IHollerAuthorizer` decides who may call whom (`CanCallAsync`) and join which room (`CanJoinRoomAsync`). The
   default allows everything. A denied call looks to the caller like an offline user, so it reveals nothing.
-- `IIceServerProvider` replaces the ICE server list entirely, e.g. for a hosted TURN service with its own API.
+- `IIceServerProvider` supplies ICE servers per user (see TURN above).
 
 ## How it works
 
@@ -167,6 +222,7 @@ Extension points (register your own before `AddHoller`):
 
 - `src/Holler`: components, `HollerClient`, the WebRTC engine (`wwwroot/holler.js`) and hub signaling for WebAssembly
 - `src/Holler.Server`: the hub, the router and the in-process channel for Server circuits
+- `src/Holler.Cloudflare`: Cloudflare Realtime TURN provider (`AddHollerCloudflareTurn`)
 - `src/Holler.Tests`: router tests
 - `src/Holler.E2E`: Playwright tests that run the sample in headless Chromium with fake camera/mic devices
 - `src/samples/Holler.Sample`: a demo with name-only sign-in, presence, 1:1 calls, rooms and chat in every render mode
@@ -185,3 +241,11 @@ dotnet test src/Holler.E2E
 
 The E2E fixture starts the sample on a free port. It drives real WebRTC calls and rooms between several
 signed-in browser contexts, across Server, WebAssembly and Auto. If Chromium isn't installed, the tests are skipped.
+
+The relay test (`RelayTests`) proves TURN end to end with relay-only mode. It needs a Cloudflare TURN key in the
+test project's user secrets, and is skipped without one:
+
+```
+dotnet user-secrets set "Holler:CloudflareTurn:KeyId" "<turn token id>" --project src/Holler.E2E
+dotnet user-secrets set "Holler:CloudflareTurn:ApiToken" "<api token>" --project src/Holler.E2E
+```
