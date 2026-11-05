@@ -64,7 +64,10 @@ For your own UI, inject `HollerClient` (or inherit `HollerComponentBase`):
   `SendMessageAsync`, plus `Calls`, `Rooms`, `OnlineUsers`.
 - Camera and microphone: `StartMediaAsync`, `StopMediaAsync`, `IsMicrophoneOn`/`IsCameraOn`,
   `ToggleMicrophoneAsync`/`ToggleCameraAsync`, `GetCamerasAsync`/`GetMicrophonesAsync`,
-  `SelectCameraAsync`/`SelectMicrophoneAsync`, `RetryMediaAsync`.
+  `SelectCameraAsync`/`SelectMicrophoneAsync`, `RetryMediaAsync`, and `MediaIssue` (why the camera or microphone
+  isn't running, in words for the user: blocked, in use by another app, or missing).
+- Diagnostics: `HollerPeer.Route` (direct or relayed through TURN), and logging to `ILogger` (category
+  `Holler.HollerClient`): media results, connection states and routes per player.
 - Events: `Changed`, `IncomingCall`, `MessageReceived`.
 
 ### Video bandwidth

@@ -10,7 +10,7 @@
 
   <PropertyGroup>
     <PackageId>Holler.Server</PackageId>
-    <Version>0.9.0</Version>
+    <Version>0.9.1</Version>
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <Description>Server side of Holler: the SignalR signaling hub and Blazor Server support for peer-to-peer WebRTC in Blazor.</Description>
     <Authors>Tom Laird-McConnell</Authors>

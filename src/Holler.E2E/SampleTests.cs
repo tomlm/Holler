@@ -238,23 +238,82 @@ public class SampleTests
         var a = await SignInAsync("quin", realPermissions: true);
         await SetMediaPermissionAsync(a.Page, "denied");   // what the user's "Block" leaves behind
         await a.Page.GotoAsync(RoomUrl("server", NewRoom()));
-        await a.Page.GetByText("Camera or microphone is blocked").WaitForAsync(new() { Timeout = 20_000 });
+        await a.Page.GetByText("Camera and microphone blocked").WaitForAsync(new() { Timeout = 20_000 });
 
         // The user switches the site to Allow in the address bar; Holler notices and starts the camera itself.
         await SetMediaPermissionAsync(a.Page, "granted");
         await a.Page.WaitForFunctionAsync(
             "() => [...document.querySelectorAll('.holler-tile-local video')].some(v => v.videoWidth > 0)",
             null, new() { Timeout = 15_000 });
-        await a.Page.GetByText("Camera or microphone is blocked").WaitForAsync(new() { State = WaitForSelectorState.Detached, Timeout = 5_000 });
+        await a.Page.GetByText("Camera and microphone blocked").WaitForAsync(new() { State = WaitForSelectorState.Detached, Timeout = 5_000 });
+    }
+
+    [Test]
+    public async Task Blocked_camera_with_microphone_allowed_says_so_and_adds_video_once_allowed()
+    {
+        // Like a camera that won't start: the call goes ahead with audio only, and the user is told why.
+        var a = await SignInAsync("ria", realPermissions: true);
+        await SetMediaPermissionAsync(a.Page, "denied", "camera");
+        await SetMediaPermissionAsync(a.Page, "granted", "microphone");
+        await a.Page.GotoAsync(RoomUrl("server", NewRoom()));
+        await a.Page.GetByText("Camera blocked").WaitForAsync(new() { Timeout = 20_000 });
+        Assert.That(await a.Page.GetByRole(AriaRole.Button, new() { Name = "Mute", Exact = true }).IsEnabledAsync(), Is.True, "microphone running");
+
+        await SetMediaPermissionAsync(a.Page, "granted", "camera");
+        await a.Page.WaitForFunctionAsync(
+            "() => [...document.querySelectorAll('.holler-tile-local video')].some(v => v.videoWidth > 0)",
+            null, new() { Timeout = 15_000 });
+        await a.Page.GetByText("Camera blocked").WaitForAsync(new() { State = WaitForSelectorState.Detached, Timeout = 5_000 });
+    }
+
+    [Test]
+    public async Task A_tap_unlocks_audio_on_touch_screens()
+    {
+        // Real autoplay rules (no override flag) and a touch screen: audible playback waits for a tap, and the tap
+        // starts it. Chromium also accepts a touch pointerdown; Safari only counts the finger lifting (pointerup,
+        // touchend, click), which Holler listens for too but this Chromium test can't tell apart.
+        await using var touchBrowser = await SampleAppFixture.Playwright.Chromium.LaunchAsync(new()
+        {
+            Channel = "chromium", // full Chromium: the headless shell doesn't apply autoplay rules
+            Args = ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream", "--autoplay-policy=user-gesture-required"],
+        });
+        var room = NewRoom();
+        var a = await SignInAsync("sam");
+        await a.Page.GotoAsync(RoomUrl("server", room));
+
+        var context = await touchBrowser.NewContextAsync(new() { HasTouch = true, IsMobile = true, Permissions = ["camera", "microphone"] });
+        _contexts.Add(context);
+        // Sign in elsewhere and copy the cookie: any click on the site in this browser would count as
+        // interaction and allow audible autoplay, leaving nothing for the tap to unlock.
+        var signedIn = await SignInAsync("tia");
+        var cookies = await signedIn.Page.Context.CookiesAsync();
+        await context.AddCookiesAsync(cookies.Select(c => new Cookie
+        {
+            Name = c.Name, Value = c.Value, Domain = c.Domain, Path = c.Path, Expires = c.Expires,
+            HttpOnly = c.HttpOnly, Secure = c.Secure, SameSite = c.SameSite,
+        }));
+        var b = await context.NewPageAsync();
+        await b.GotoAsync(RoomUrl("server", room));
+        await b.WaitForFunctionAsync($"() => {RemoteVideos}.some(v => v.srcObject)", null, new() { Timeout = 30_000 });
+
+        await Task.Delay(2000);
+        if (!await b.EvaluateAsync<bool>($"() => {RemoteVideos}.some(v => v.paused)"))
+            Assert.Inconclusive("This browser let audible media autoplay, so there is nothing for a tap to unlock.");
+
+        await b.Touchscreen.TapAsync(5, 5);
+        await b.WaitForFunctionAsync($"() => {RemoteVideos}.every(v => !v.paused)", null, new() { Timeout = 5_000 });
     }
 
     /// <summary>Sets camera and microphone permission for the sample's origin in this page's browser context.</summary>
-    private static async Task SetMediaPermissionAsync(IPage page, string setting)
+    private static Task SetMediaPermissionAsync(IPage page, string setting) =>
+        SetMediaPermissionAsync(page, setting, "camera", "microphone");
+
+    private static async Task SetMediaPermissionAsync(IPage page, string setting, params string[] names)
     {
         var cdp = await page.Context.NewCDPSessionAsync(page);
         var target = await cdp.SendAsync("Target.getTargetInfo");
         var contextId = target!.Value.GetProperty("targetInfo").GetProperty("browserContextId").GetString()!;
-        foreach (var name in new[] { "camera", "microphone" })
+        foreach (var name in names)
         {
             await cdp.SendAsync("Browser.setPermission", new Dictionary<string, object>
             {

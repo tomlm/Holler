@@ -44,16 +44,17 @@
     </span>
 </span>
 
-@if (Holler.LocalMedia is { PermissionDenied: true })
+@if (Holler.MediaIssue is { } issue)
 {
+    @* Blocked, in use by another app, or missing: say which, and offer a retry. *@
     <div class="holler-error holler-permission" role="alert">
-        Camera or microphone is blocked. Click the camera icon in the address bar, choose <strong>Allow</strong>, then
+        @issue
         <button type="button" class="holler-btn holler-primary" @onclick="() => Run(Holler.RetryMediaAsync)">Try again</button>
     </div>
 }
-else if (Error is not null || Holler.LocalMedia is { Ok: false })
+else if (Error is not null)
 {
-    <div class="holler-error">@(Error ?? Holler.LocalMedia?.Error)</div>
+    <div class="holler-error">@Error</div>
 }
 
 @code {
