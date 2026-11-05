@@ -23,6 +23,9 @@ public sealed class SampleAppFixture
 
     private static SampleApp? _app;
     private static IPlaywright? _playwright;
+
+    /// <summary>For tests that need a browser launched with different settings.</summary>
+    public static IPlaywright Playwright => _playwright!;
     private static string? _skipReason;
 
     /// <summary>Call first in each test: skips when the Playwright browser isn't installed.</summary>
@@ -35,7 +38,7 @@ public sealed class SampleAppFixture
     [OneTimeSetUp]
     public async Task StartAsync()
     {
-        _playwright = await Playwright.CreateAsync();
+        _playwright = await Microsoft.Playwright.Playwright.CreateAsync();
         try
         {
             Browser = await _playwright.Chromium.LaunchAsync(new()

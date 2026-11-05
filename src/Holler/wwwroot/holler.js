@@ -26,8 +26,13 @@ class Engine {
                 for (const element of set)
                     if (element.srcObject && element.paused) element.play?.().catch(() => { });
         };
-        for (const type of ['pointerdown', 'keydown'])
+        // Touch screens only grant playback permission when the finger lifts (pointerup/touchend/click),
+        // mice on pointerdown; listen for all of them.
+        this.resumeEvents = ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown'];
+        for (const type of this.resumeEvents)
             document.addEventListener(type, this.resumePlayback, { capture: true, passive: true });
+        this.blockedPlayback = new WeakSet();
+        this._log('info', `browser: ${navigator.userAgent}`);
     }
 
     // Applies to peer connections created afterwards (e.g. refreshed TURN credentials).
@@ -256,14 +261,17 @@ class Engine {
                 await pc.setLocalDescription();
                 this._notify('OnLocalSignal', key, 'description', JSON.stringify(pc.localDescription));
             } catch (e) {
-                console.error('holler: negotiation failed', e);
+                this._log('warn', `${key} negotiation failed: ${e.name}: ${e.message}`);
             } finally {
                 peer.makingOffer = false;
             }
         };
         pc.onconnectionstatechange = () => {
             // Encodings only exist once negotiated, so apply any size the viewer already asked for.
-            if (pc.connectionState === 'connected') this._applyEncoding(peer);
+            if (pc.connectionState === 'connected') {
+                this._applyEncoding(peer);
+                this._reportRoute(peer);
+            }
             this._notify('OnPeerState', key, pc.connectionState);
         };
 
@@ -318,7 +326,7 @@ class Engine {
     }
 
     dispose() {
-        for (const type of ['pointerdown', 'keydown'])
+        for (const type of this.resumeEvents)
             document.removeEventListener(type, this.resumePlayback, { capture: true });
         for (const key of [...this.peers.keys()]) this.closePeer(key);
         this.stopMedia();
@@ -442,7 +450,7 @@ class Engine {
             try {
                 await sender.setParameters(parameters);
             } catch (e) {
-                console.warn('holler: could not apply video encoding', e);
+                this._log('warn', `${peer.key} could not apply video encoding: ${e.name}: ${e.message}`);
             }
         });
     }
@@ -451,7 +459,7 @@ class Engine {
         try {
             await peer.pc.addIceCandidate(candidate);
         } catch (e) {
-            if (!peer.ignoreOffer) console.warn('holler: failed to add ICE candidate', e);
+            if (!peer.ignoreOffer) this._log('warn', `${peer.key} failed to add ICE candidate: ${e.name}: ${e.message}`);
         }
     }
 
@@ -463,7 +471,39 @@ class Engine {
 
     _bind(element, stream) {
         if (element.srcObject !== stream) element.srcObject = stream;
-        if (stream) element.play?.().catch(() => { /* autoplay blocked until user gesture */ });
+        if (stream) element.play?.().catch(e => {
+            // Usually autoplay policy: resumePlayback retries on the next tap, click or key press.
+            if (this.blockedPlayback.has(element)) return;
+            this.blockedPlayback.add(element);
+            this._log('info', `${element.tagName.toLowerCase()} playback blocked until the user interacts: ${e.name}`);
+        });
+    }
+
+    // How a connected peer is actually reached: "host"/"srflx" are direct, "relay" goes through TURN.
+    async _reportRoute(peer) {
+        try {
+            const stats = await peer.pc.getStats();
+            let pair = null;
+            stats.forEach(report => {
+                if (report.type === 'transport' && report.selectedCandidatePairId) pair = stats.get(report.selectedCandidatePairId);
+            });
+            if (!pair) stats.forEach(report => {
+                if (report.type === 'candidate-pair' && report.nominated && report.state === 'succeeded') pair = report;
+            });
+            const local = pair && stats.get(pair.localCandidateId);
+            const remote = pair && stats.get(pair.remoteCandidateId);
+            if (!local || !remote) return;
+            const protocol = local.relayProtocol || local.protocol || '';
+            this._notify('OnPeerRoute', peer.key, local.candidateType, remote.candidateType, protocol);
+        } catch (e) {
+            this._log('warn', `${peer.key} could not read route: ${e.name}: ${e.message}`);
+        }
+    }
+
+    // Diagnostics go to the server's log (HollerClient's ILogger), where they can be read after the fact.
+    _log(level, message) {
+        if (level === 'warn') console.warn('holler:', message);
+        this._notify('OnLog', level, message);
     }
 
     _notify(method, ...args) {

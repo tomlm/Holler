@@ -61,6 +61,15 @@ public sealed class HollerPeer
     public bool IsVideoVisible => HasVideo && VideoEnabled;
     public bool DataChannelOpen { get; internal set; }
 
+    /// <summary>
+    /// How the connection reaches this peer once connected: "direct" (local network or through the routers) or
+    /// "relay" (through a TURN server), with the transport, e.g. "relay (udp)". Null until connected.
+    /// </summary>
+    public string? Route { get; internal set; }
+
+    /// <summary>The connection goes through a TURN relay.</summary>
+    public bool IsRelayed => Route?.StartsWith("relay", StringComparison.Ordinal) == true;
+
     internal bool Created { get; set; }
 }
 
